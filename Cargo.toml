@@ -1,0 +1,124 @@
+[package]
+name        = "sniper_bot"
+version     = "0.1.0"
+edition     = "2024"
+authors     = ["HFT Rust Migration"]
+description = "Ultra-low latency binary options momentum sniper — native Rust rewrite"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BUILD PROFILES
+#
+# Compile for release with CPU-native SIMD/NEON on aarch64 Graviton:
+#   RUSTFLAGS="-C target-cpu=native" cargo build --release
+# ─────────────────────────────────────────────────────────────────────────────
+[profile.release]
+opt-level        = 3        # Maximum LLVM optimisation passes
+lto              = "fat"    # Full cross-crate link-time optimisation
+codegen-units    = 1        # Single CU → best inlining & dead-code elimination
+panic            = "abort"  # No stack-unwinding tables; smaller binary, zero overhead
+strip            = "debuginfo" # Strip DWARF; keep symbol table for crash reports
+overflow-checks  = false    # Remove arithmetic overflow guards on the hot path
+
+[profile.dev]
+opt-level = 1               # Enough to suppress debug-build SIMD/iterator penalties
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEPENDENCIES
+# ─────────────────────────────────────────────────────────────────────────────
+[dependencies]
+
+# ── Async Runtime ─────────────────────────────────────────────────────────────
+# "full" = rt-multi-thread, io, net, time, sync, macros, signal, fs, process.
+# We pin the work-stealing multi-thread scheduler; Binance + Polymarket streams
+# will each be spawned on dedicated OS threads (spawn_blocking / task::spawn).
+tokio = { version = "1", features = ["full"] }
+
+# ── WebSocket (zero-copy frames over tokio) ───────────────────────────────────
+# rustls-tls-native-roots: pure-Rust TLS — no OpenSSL / libssl-dev on aarch64.
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+# Direct access to Message / Error / CloseFrame types without going through
+# the tokio-tungstenite re-export path.
+tungstenite = { version = "0.26", default-features = false }
+
+# ── HTTP Order Execution ──────────────────────────────────────────────────────
+# default-features = false evicts OpenSSL; rustls keeps us dependency-clean.
+# http2 enables connection keep-alive multiplexing on the CLOB endpoint.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "http2",
+    "gzip",
+] }
+
+# ── JSON Serialisation / Deserialisation ──────────────────────────────────────
+serde      = { version = "1", features = ["derive"] }
+# raw_value feature: borrow &RawValue from the input buffer — zero extra alloc
+# when forwarding or inspecting raw JSON fragments on the WS hot path.
+serde_json = { version = "1", features = ["raw_value"] }
+
+# ── Async Stream Combinators ──────────────────────────────────────────────────
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# ── Structured Async-Aware Logging ────────────────────────────────────────────
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi", "chrono"] }
+
+# ── Error Handling ────────────────────────────────────────────────────────────
+thiserror = "2"   # Derive-based typed errors — zero runtime cost, no allocations
+anyhow    = "1"   # Boxed errors for I/O boundary layers (never on the hot path)
+
+# ── Configuration from .env ───────────────────────────────────────────────────
+dotenvy = "0.15"
+
+# ── Synchronisation Primitives ────────────────────────────────────────────────
+# parking_lot: ~2-3× faster than std::sync::{Mutex,RwLock} on aarch64 via
+# adaptive spin-then-park strategy; no poisoning overhead.
+parking_lot = { version = "0.12", features = ["arc_lock", "send_guard"] }
+
+# ── Atomic f64 for EMA on the Hot Tick Path ───────────────────────────────────
+# std only ships AtomicU64. portable-atomic provides a genuine lock-free
+# AtomicF64 using LL/SC (Load-Link/Store-Conditional) native to aarch64 —
+# no spin-locks, no UB, compatible with the Rust memory model.
+portable-atomic = { version = "1", features = ["float"] }
+
+# ── Lock-free Atomic Arc Swap (shared read-state without RwLock) ──────────────
+# arc-swap lets the SituationRoom writer atomically publish a new threshold
+# struct while Binance tick readers see it instantly via a single pointer load.
+arc-swap = "1"
+
+# ── Lock-free Bounded Channels (faster than tokio::sync::mpsc for hot path) ───
+# crossbeam-channel uses a pre-allocated ring buffer; ideal for the
+# sniper evaluate_trade → executor handoff where we need sub-microsecond hand-off.
+crossbeam-channel = "0.5"
+
+# ── Zero-Copy Byte Buffers ────────────────────────────────────────────────────
+# Pre-allocate a Bytes / BytesMut pool; reuse across WebSocket message loops
+# to avoid heap churn in the hot on_message path.
+bytes = "1"
+
+# ── URL Building ──────────────────────────────────────────────────────────────
+url = "2"
+
+# ── Timestamps & Duration Arithmetic ─────────────────────────────────────────
+chrono = { version = "0.4", features = ["serde"] }
+
+# ── Lazy One-Time Global Initialisation ──────────────────────────────────────
+# Used for the global CONFIG singleton — parsed once from .env at startup.
+once_cell = "1"
+
+# ── Ethereum / EVM Primitives (CLOB Order Signing, Polygon Balance Checks) ───
+# k256:  secp256k1 ECDSA — implements EIP-712 / Polymarket L2 API auth signing.
+# sha3:  Keccak-256 for EIP-191 and EIP-712 typed-data digests.
+# hex:   encode/decode raw private key bytes.
+k256  = { version = "0.13", features = ["ecdsa"] }
+sha3  = "0.10"
+hex   = "0.4"
+
+# ── Reconnect / Back-Off for WS Reconnect Loop ────────────────────────────────
+tokio-retry = "0.3"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DEV / TEST DEPENDENCIES
+# ─────────────────────────────────────────────────────────────────────────────
+[dev-dependencies]
+tokio-test = "0.4"
