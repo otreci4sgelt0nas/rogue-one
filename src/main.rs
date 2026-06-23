@@ -36,7 +36,8 @@
 //! RUST_LOG=info                    # sensible default
 //! RUST_LOG=warn                    # quiet production mode
 //! ```
-
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -210,8 +211,9 @@ async fn main() {
     {
         let state = Arc::clone(&state);
         let mf    = Arc::clone(&market_fetcher);
+        let exec  = Arc::clone(&executor);
         tokio::spawn(async move {
-            run_binance_stream(state, mf).await;
+            run_binance_stream(state, mf, exec).await;
         });
         info!(url = %CONFIG.binance_ws_url, "Binance aggTrade WS task spawned.");
     }

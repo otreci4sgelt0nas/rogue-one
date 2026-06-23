@@ -60,14 +60,19 @@
 //! Full implementation: Step 2.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use tokio::time::sleep;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::config::CONFIG;
-use crate::errors::{WsError, WsResult};
+use crate::errors::{WsError, WsOrigin, WsResult};
+use crate::executor::ClobExecutor;
 use crate::state::{Direction, MarketInfo, SharedState, TriggerSnapshot};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -175,13 +180,18 @@ fn backoff_delay(attempt: u32) -> Duration {
 pub async fn run_binance_stream(
     state: Arc<SharedState>,
     market_fetcher: Arc<crate::market_fetcher::MarketFetcher>,
+    executor: Arc<ClobExecutor>,
 ) {
     info!("Binance stream task started. URL: {}", CONFIG.binance_ws_url);
 
     let mut attempt: u32 = 0;
 
     loop {
-        match binance_connect_and_process(Arc::clone(&state), Arc::clone(&market_fetcher)).await {
+        match binance_connect_and_process(
+            Arc::clone(&state),
+            Arc::clone(&market_fetcher),
+            Arc::clone(&executor),
+        ).await {
             Ok(()) => {
                 // Clean close — reconnect immediately.
                 info!("[Binance] Clean WS close. Reconnecting immediately...");
@@ -214,43 +224,38 @@ pub async fn run_binance_stream(
 /// - `Err(WsError::Stopped)` when the stream should permanently stop.
 /// - `Err(_)` on transport or parse errors (triggers back-off reconnect).
 async fn binance_connect_and_process(
-    _state: Arc<SharedState>,
-    _market_fetcher: Arc<crate::market_fetcher::MarketFetcher>,
+    state: Arc<SharedState>,
+    market_fetcher: Arc<crate::market_fetcher::MarketFetcher>,
+    executor: Arc<ClobExecutor>,
 ) -> WsResult<()> {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   let (mut ws, _) = connect_async(&CONFIG.binance_ws_url)
-    //       .await
-    //       .map_err(|e| WsError::Transport { origin: WsOrigin::Binance, source: e })?;
-    //
-    //   info!("Connected to Binance aggTrade stream.");
-    //
-    //   while let Some(msg) = ws.next().await {
-    //       let msg = msg.map_err(|e| WsError::Transport { origin: WsOrigin::Binance, source: e })?;
-    //
-    //       match msg {
-    //           Message::Text(text) => {
-    //               if let Err(e) = binance_process_message(&state, &text, &market_fetcher).await {
-    //                   // Non-fatal parse errors: log and continue.
-    //                   warn!(error = %e, "[Binance] Message parse error — skipping.");
-    //               }
-    //           }
-    //           Message::Ping(payload) => { ws.send(Message::Pong(payload)).await.ok(); }
-    //           Message::Close(frame) => {
-    //               let code   = frame.as_ref().map(|f| f.code.into());
-    //               let reason = frame.as_ref().map(|f| f.reason.to_string());
-    //               return Err(WsError::Closed { origin: WsOrigin::Binance, code, reason });
-    //           }
-    //           _ => {}
-    //       }
-    //   }
-    //
-    //   Ok(())
+    let (mut ws, _) = connect_async(&CONFIG.binance_ws_url)
+        .await
+        .map_err(|e| WsError::Transport { origin: WsOrigin::Binance, source: e })?;
 
-    // Stub: yield immediately, will be replaced in Step 2.
-    tokio::time::sleep(Duration::from_secs(u64::MAX)).await;
+    info!("[Binance] Connected to aggTrade stream.");
+
+    while let Some(msg) = ws.next().await {
+        let msg = msg.map_err(|e| WsError::Transport { origin: WsOrigin::Binance, source: e })?;
+
+        match msg {
+            Message::Text(text) => {
+                if let Err(e) = binance_process_message(
+                    &state, &text, &market_fetcher, &executor,
+                ).await {
+                    // Non-fatal parse errors: log and continue.
+                    warn!(error = %e, "[Binance] Message parse error — skipping.");
+                }
+            }
+            Message::Ping(payload) => { ws.send(Message::Pong(payload)).await.ok(); }
+            Message::Close(frame) => {
+                let code   = frame.as_ref().map(|f| f.code.into());
+                let reason = frame.as_ref().map(|f| f.reason.to_string());
+                return Err(WsError::Closed { origin: WsOrigin::Binance, code, reason });
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
 }
 
@@ -275,62 +280,59 @@ async fn binance_connect_and_process(
 /// Returns `Err(WsError)` only for unrecoverable parse failures. Routine
 /// "no threshold crossed" paths return `Ok(())` silently.
 async fn binance_process_message(
-    _state: &Arc<SharedState>,
-    _text: &str,
-    _market_fetcher: &Arc<crate::market_fetcher::MarketFetcher>,
+    state: &Arc<SharedState>,
+    text: &str,
+    market_fetcher: &Arc<crate::market_fetcher::MarketFetcher>,
+    executor: &Arc<ClobExecutor>,
 ) -> WsResult<()> {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   let trade: BinanceAggTrade = serde_json::from_str(text)
-    //       .map_err(|e| WsError::JsonParse {
-    //           origin:  WsOrigin::Binance,
-    //           snippet: text.chars().take(120).collect(),
-    //           source:  e,
-    //       })?;
-    //
-    //   let ts    = trade.event_time_ms as f64 / 1000.0;
-    //   let price = trade.price.parse::<f64>()
-    //       .map_err(|_| WsError::MissingField { origin: WsOrigin::Binance, field: "p (price parse)" })?;
-    //
-    //   // ── Expiry / rollover check ────────────────────────────────────────────
-    //   if state.is_market_expired(ts) {
-    //       if state.is_rolling_over.compare_exchange(
-    //           false, true, Ordering::AcqRel, Ordering::Relaxed
-    //       ).is_ok() {
-    //           let s = Arc::clone(state);
-    //           let mf = Arc::clone(market_fetcher);
-    //           tokio::spawn(async move { crate::state::handle_rollover(s, mf).await; });
-    //       }
-    //       return Ok(()); // Always drop expired messages.
-    //   }
-    //
-    //   // ── Pre-expiry guard (no new positions within 15s of expiry) ──────────
-    //   if state.seconds_to_expiry(ts) < 15.0 {
-    //       return Ok(());
-    //   }
-    //
-    //   // ── EMA update ────────────────────────────────────────────────────────
-    //   let delta = state.binance.update(price, ts, CONFIG.momentum_window_sec);
-    //
-    //   // ── Threshold evaluation (the hot gate) ───────────────────────────────
-    //   if let Some(direction) = state.evaluate_delta(delta) {
-    //       let snapshot = build_trigger_snapshot(state, direction, delta, ts);
-    //       match snapshot {
-    //           Some(snap) => {
-    //               let s = Arc::clone(state);
-    //               tokio::spawn(async move { crate::sniper::trigger_buy(s, snap).await; });
-    //           }
-    //           None => {
-    //               // No ask available — re-arm immediately.
-    //               state.sniper.arm();
-    //               warn!("[Binance] No ask price for {:?} — blind-fire aborted.", direction);
-    //           }
-    //       }
-    //   }
-    //
-    //   Ok(())
+    let trade: BinanceAggTrade = serde_json::from_str(text)
+        .map_err(|e| WsError::JsonParse {
+            origin:  WsOrigin::Binance,
+            snippet: text.chars().take(120).collect(),
+            source:  e,
+        })?;
+
+    let ts    = trade.event_time_ms as f64 / 1000.0;
+    let price = trade.price.parse::<f64>()
+        .map_err(|_| WsError::MissingField { origin: WsOrigin::Binance, field: "p (price parse)" })?;
+
+    // ── Expiry / rollover check ────────────────────────────────────────────────
+    if state.is_market_expired(ts) {
+        if state.is_rolling_over
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let s  = Arc::clone(state);
+            let mf = Arc::clone(market_fetcher);
+            tokio::spawn(async move { crate::state::handle_rollover(s, mf).await; });
+        }
+        return Ok(()); // Always drop expired messages.
+    }
+
+    // ── Pre-expiry guard (no new positions within 15s of expiry) ──────────────
+    if state.seconds_to_expiry(ts) < 15.0 {
+        return Ok(());
+    }
+
+    // ── EMA update ────────────────────────────────────────────────────────────
+    let delta = state.binance.update(price, ts, CONFIG.momentum_window_sec);
+
+    // ── Threshold evaluation (the hot gate) ───────────────────────────────────
+    if let Some(direction) = state.evaluate_delta(delta) {
+        let snapshot = build_trigger_snapshot(state, direction, delta, ts);
+        match snapshot {
+            Some(snap) => {
+                let s = Arc::clone(state);
+                let e = Arc::clone(executor);
+                tokio::spawn(async move { crate::sniper::trigger_buy(s, e, snap).await; });
+            }
+            None => {
+                // No ask available — re-arm immediately.
+                state.sniper.arm();
+                warn!("[Binance] No ask price for {} — blind-fire aborted.", direction);
+            }
+        }
+    }
 
     Ok(())
 }
@@ -349,54 +351,52 @@ async fn binance_process_message(
 /// effective_ask       = min(real_ask, synthetic_ask)
 /// ```
 fn build_trigger_snapshot(
-    _state: &Arc<SharedState>,
-    _direction: Direction,
-    _delta: f64,
-    _exchange_ts: f64,
+    state: &Arc<SharedState>,
+    direction: Direction,
+    delta: f64,
+    exchange_ts: f64,
 ) -> Option<TriggerSnapshot> {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   let book = state.book.snapshot_for_direction(direction);
-    //   let effective_ask = book.effective_ask()?;   // None → abort
-    //
-    //   let max_price = (effective_ask * CONFIG.slippage_multiplier).min(0.99);
-    //   let spread    = book.spread();
-    //
-    //   // Spread safety gate (checked here so executor never sees a bad spread).
-    //   if let Some(sp) = spread {
-    //       if sp > CONFIG.max_spread_cents {
-    //           warn!(spread = sp, max = CONFIG.max_spread_cents,
-    //                 "[{}] Spread too wide — aborting.", direction);
-    //           return None;
-    //       }
-    //   }
-    //
-    //   let guard    = state.market.load();
-    //   let market   = guard.as_ref()?;
-    //   let token_id = match direction {
-    //       Direction::Up   => market.token_id_up.clone(),
-    //       Direction::Down => market.token_id_down.clone(),
-    //   };
-    //   let market_slug  = market.market_slug.clone();
-    //   let ev_breakdown = state.ev_breakdown(direction);
-    //
-    //   Some(TriggerSnapshot {
-    //       direction,
-    //       delta,
-    //       trigger_instant: std::time::Instant::now(),
-    //       exchange_ts,
-    //       book,
-    //       token_id,
-    //       market_slug,
-    //       effective_ask,
-    //       max_price,
-    //       spread,
-    //       ev_breakdown,
-    //   })
+    let book = state.book.snapshot_for_direction(direction);
+    let effective_ask = book.effective_ask()?; // None → abort
 
-    None
+    let max_price = (effective_ask * CONFIG.slippage_multiplier).min(0.99);
+    let spread    = book.spread();
+
+    // Spread safety gate — checked here so the executor never sees a bad spread.
+    if let Some(sp) = spread {
+        if sp > CONFIG.max_spread_cents {
+            warn!(
+                spread = sp,
+                max    = CONFIG.max_spread_cents,
+                "[{}] Spread too wide — aborting trigger.",
+                direction
+            );
+            return None;
+        }
+    }
+
+    let guard    = state.market.load();
+    let market   = guard.as_ref()?;
+    let token_id = match direction {
+        Direction::Up   => market.token_id_up.clone(),
+        Direction::Down => market.token_id_down.clone(),
+    };
+    let market_slug  = market.market_slug.clone();
+    let ev_breakdown = state.ev_breakdown(direction);
+
+    Some(TriggerSnapshot {
+        direction,
+        delta,
+        trigger_instant: std::time::Instant::now(),
+        exchange_ts,
+        book,
+        token_id,
+        market_slug,
+        effective_ask,
+        max_price,
+        spread,
+        ev_breakdown,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -473,52 +473,53 @@ pub async fn run_polymarket_stream(state: Arc<SharedState>) {
 ///    from rollover can interrupt the `ws.next().await`.
 async fn polymarket_connect_and_process(
     state: Arc<SharedState>,
-    _market: &Arc<MarketInfo>,
+    market: &Arc<MarketInfo>,
 ) -> WsResult<()> {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   let (mut ws, _) = connect_async(&CONFIG.poly_ws_url)
-    //       .await
-    //       .map_err(|e| WsError::Transport { origin: WsOrigin::Polymarket, source: e })?;
-    //
-    //   info!("[Polymarket] Connected to L2 CLOB stream.");
-    //
-    //   // Send subscription
-    //   let sub = PolySubscription {
-    //       assets_ids: &[&market.token_id_up, &market.token_id_down],
-    //       sub_type:   "market",
-    //   };
-    //   let sub_json = serde_json::to_string(&sub).expect("subscription serialization");
-    //   ws.send(Message::Text(sub_json)).await
-    //       .map_err(|e| WsError::SubscriptionFailed { origin: WsOrigin::Polymarket, source: e })?;
-    //
-    //   loop {
-    //       tokio::select! {
-    //           msg = ws.next() => {
-    //               match msg {
-    //                   Some(Ok(Message::Text(text))) => {
-    //                       polymarket_process_message(&state, &text, market);
-    //                   }
-    //                   Some(Ok(Message::Ping(p))) => { ws.send(Message::Pong(p)).await.ok(); }
-    //                   Some(Ok(Message::Close(_))) | None => break,
-    //                   Some(Err(e)) => return Err(WsError::Transport { origin: WsOrigin::Polymarket, source: e }),
-    //                   _ => {}
-    //               }
-    //           }
-    //           _ = state.poly_disconnect.notified() => {
-    //               info!("[Polymarket] Disconnect signal received. Closing WS...");
-    //               ws.close(None).await.ok();
-    //               return Ok(());
-    //           }
-    //       }
-    //   }
-    //
-    //   Ok(())
+    let (mut ws, _) = connect_async(&CONFIG.poly_ws_url)
+        .await
+        .map_err(|e| WsError::Transport { origin: WsOrigin::Polymarket, source: e })?;
 
-    // Stub: suspend indefinitely until disconnect signal.
-    state.poly_disconnect.notified().await;
+    info!("[Polymarket] Connected to L2 CLOB stream.");
+
+    // Send subscription for both token legs.
+    let sub = PolySubscription {
+        assets_ids: &[market.token_id_up.as_str(), market.token_id_down.as_str()],
+        sub_type:   "market",
+    };
+    let sub_json = serde_json::to_string(&sub).expect("subscription serialization");
+    ws.send(Message::Text(sub_json.into()))
+        .await
+        .map_err(|e| WsError::SubscriptionFailed { origin: WsOrigin::Polymarket, source: e })?;
+
+    info!(
+        token_up   = %market.token_id_up,
+        token_down = %market.token_id_down,
+        "[Polymarket] Subscribed to L2 orderbook for both tokens."
+    );
+
+    loop {
+        tokio::select! {
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        polymarket_process_message(&state, &text, market);
+                    }
+                    Some(Ok(Message::Ping(p))) => { ws.send(Message::Pong(p)).await.ok(); }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(e)) => {
+                        return Err(WsError::Transport { origin: WsOrigin::Polymarket, source: e });
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+            _ = state.poly_disconnect.notified() => {
+                info!("[Polymarket] Disconnect signal received. Closing WS...");
+                ws.close(None).await.ok();
+                return Ok(());
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -542,36 +543,32 @@ async fn polymarket_connect_and_process(
 /// This function is intentionally **synchronous** (no `async`) — it does no
 /// I/O and must not block the WS receive loop. All writes are via atomics.
 fn polymarket_process_message(
-    _state: &Arc<SharedState>,
-    _text: &str,
-    _market: &Arc<MarketInfo>,
+    state: &Arc<SharedState>,
+    text: &str,
+    market: &Arc<MarketInfo>,
 ) {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   // Try array first, then single object.
-    //   let events: Vec<PolyBookEvent> = if text.trim_start().starts_with('[') {
-    //       match serde_json::from_str(text) {
-    //           Ok(v) => v,
-    //           Err(e) => {
-    //               warn!(error = %e, "[Polymarket] Failed to parse message array.");
-    //               return;
-    //           }
-    //       }
-    //   } else {
-    //       match serde_json::from_str::<PolyBookEvent>(text) {
-    //           Ok(e) => vec![e],
-    //           Err(err) => {
-    //               warn!(error = %err, "[Polymarket] Failed to parse single event.");
-    //               return;
-    //           }
-    //       }
-    //   };
-    //
-    //   for event in &events {
-    //       polymarket_update_orderbook(state, event, market);
-    //   }
+    // Try JSON array first, then fall back to a single object.
+    let events: Vec<PolyBookEvent> = if text.trim_start().starts_with('[') {
+        match serde_json::from_str(text) {
+            Ok(v)  => v,
+            Err(e) => {
+                warn!(error = %e, "[Polymarket] Failed to parse message array.");
+                return;
+            }
+        }
+    } else {
+        match serde_json::from_str::<PolyBookEvent>(text) {
+            Ok(e)    => vec![e],
+            Err(err) => {
+                warn!(error = %err, "[Polymarket] Failed to parse single event.");
+                return;
+            }
+        }
+    };
+
+    for event in &events {
+        polymarket_update_orderbook(state, event, market);
+    }
 }
 
 /// Apply a single Polymarket orderbook event to the shared atomic state.
@@ -582,50 +579,46 @@ fn polymarket_process_message(
 /// Prices that fail `str::parse::<f64>()` are skipped defensively (mirrors
 /// the Python `try: float(ask.get("price", 1.0)) / except (ValueError, TypeError): continue`).
 fn polymarket_update_orderbook<'a>(
-    _state: &Arc<SharedState>,
-    _event: &PolyBookEvent<'a>,
-    _market: &Arc<MarketInfo>,
+    state: &Arc<SharedState>,
+    event: &PolyBookEvent<'a>,
+    market: &Arc<MarketInfo>,
 ) {
-    // TODO (Step 2): Full implementation.
-    //
-    // Pseudocode:
-    //
-    //   let asset_id = match event.asset_id {
-    //       Some(id) => id,
-    //       None => return,
-    //   };
-    //
-    //   // ── Best ask: running minimum ──────────────────────────────────────────
-    //   if !event.asks.is_empty() {
-    //       let mut best: Option<f64> = None;
-    //       for level in &event.asks {
-    //           if let Ok(p) = level.price.parse::<f64>() {
-    //               if p > 0.0 {
-    //                   best = Some(match best {
-    //                       Some(b) => b.min(p),
-    //                       None    => p,
-    //                   });
-    //               }
-    //           }
-    //       }
-    //       state.book.update_ask(asset_id, best, market);
-    //   }
-    //
-    //   // ── Best bid: running maximum ──────────────────────────────────────────
-    //   if !event.bids.is_empty() {
-    //       let mut best: Option<f64> = None;
-    //       for level in &event.bids {
-    //           if let Ok(p) = level.price.parse::<f64>() {
-    //               if p > 0.0 {
-    //                   best = Some(match best {
-    //                       Some(b) => b.max(p),
-    //                       None    => p,
-    //                   });
-    //               }
-    //           }
-    //       }
-    //       state.book.update_bid(asset_id, best, market);
-    //   }
+    let asset_id = match event.asset_id {
+        Some(id) => id,
+        None     => return,
+    };
+
+    // ── Best ask: running minimum ──────────────────────────────────────────────
+    if !event.asks.is_empty() {
+        let mut best: Option<f64> = None;
+        for level in &event.asks {
+            if let Ok(p) = level.price.parse::<f64>() {
+                if p > 0.0 {
+                    best = Some(match best {
+                        Some(b) => b.min(p),
+                        None    => p,
+                    });
+                }
+            }
+        }
+        state.book.update_ask(asset_id, best, market);
+    }
+
+    // ── Best bid: running maximum ──────────────────────────────────────────────
+    if !event.bids.is_empty() {
+        let mut best: Option<f64> = None;
+        for level in &event.bids {
+            if let Ok(p) = level.price.parse::<f64>() {
+                if p > 0.0 {
+                    best = Some(match best {
+                        Some(b) => b.max(p),
+                        None    => p,
+                    });
+                }
+            }
+        }
+        state.book.update_bid(asset_id, best, market);
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

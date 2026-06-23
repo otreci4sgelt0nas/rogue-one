@@ -36,12 +36,14 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
+use std::sync::atomic::Ordering;
+
 use crate::config::CONFIG;
 
 use crate::executor::ClobExecutor;
 use crate::market_fetcher::MarketFetcher;
 use crate::situation_room::SituationRoom;
-use crate::state::{SharedState, TriggerSnapshot};
+use crate::state::{compute_next_expiry, unix_now_secs, SharedState, TriggerSnapshot};
 use crate::streams::{run_binance_stream, run_polymarket_stream};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -124,9 +126,20 @@ impl SniperBrain {
                     "❌ Failed to fetch initial market. Bot starting DISARMED — \
                      will retry on rollover."
                 );
-                // Non-fatal: the bot starts disarmed. The rollover logic will
-                // eventually re-try when the next window begins.
-                // We do NOT return Err here to keep the WS tasks alive.
+                // Non-fatal: the bot starts disarmed. Set market_expiry to the
+                // next window boundary so is_market_expired() fires when that
+                // time arrives and handle_rollover() re-fetches the market.
+                // Without this, market_expiry stays 0 and the expiry check
+                // guard (expiry > 0) never triggers, leaving the bot permanently
+                // disarmed.
+                let now         = unix_now_secs() as u64;
+                let next_expiry = compute_next_expiry(now, CONFIG.market_window_sec());
+                self.state.market_expiry.store(next_expiry, Ordering::Release);
+                info!(
+                    next_expiry = next_expiry,
+                    "📅 market_expiry set to next window boundary — \
+                     rollover will fire and re-arm at that time."
+                );
             }
         }
 
@@ -150,8 +163,9 @@ impl SniperBrain {
         {
             let state          = Arc::clone(&self.state);
             let market_fetcher = Arc::clone(&self.market_fetcher);
+            let executor       = Arc::clone(&self.executor);
             tokio::spawn(async move {
-                run_binance_stream(state, market_fetcher).await;
+                run_binance_stream(state, market_fetcher, executor).await;
             });
             info!("Binance aggTrade WS task spawned.");
         }

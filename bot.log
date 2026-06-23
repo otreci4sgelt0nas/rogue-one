@@ -1,0 +1,52 @@
+[startup] .env loaded from: /home/ubuntu/rogue-one/.env
+2026-06-23 04:19:12.237  INFO sniper_bot: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2026-06-23 04:19:12.237  INFO sniper_bot:   🦀 Sniper Bot — native Rust aarch64 HFT rewrite
+2026-06-23 04:19:12.237  INFO sniper_bot: ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2026-06-23 04:19:12.237  INFO sniper_bot: Loading configuration from environment / .env ...
+2026-06-23 04:19:12.237  INFO sniper_bot: 
+┌─────────────────────────────────────────────────────┐
+│              SNIPER BOT CONFIGURATION               │
+├─────────────────────────────────────────────────────┤
+│  Mode             : PAPER                           │
+│  Asset            : BTC                             │
+│  Window           : 15 min                            │
+│  Binance WS       : wss://stream.binance.com:9443/ws│
+│  Poly WS          : wss://ws-subscriptions-clob.poly│
+│  Private Key      : NOT SET                         │
+│  RPC URL          : NOT SET                         │
+├─────────────────────────────────────────────────────┤
+│  Momentum Thresh  : $40                             │
+│  Momentum Window  : 2s                              │
+│  Momentum Step    : 15%                              │
+│  Slippage         : 500 bps (1.05×)              │
+│  Max Buy Price    : $0.85                           │
+│  Debounce         : 0.5s                              │
+├─────────────────────────────────────────────────────┤
+│  Kelly A / B / C  : 50% / 33% / 25%                 │
+│  EV Min Score     : 40                              │
+│  EV Bailout       : 25                              │
+└─────────────────────────────────────────────────────┘
+2026-06-23 04:19:12.237  INFO sniper_bot: Configuration loaded and validated. boot_elapsed_ms=0
+2026-06-23 04:19:12.237  INFO sniper_bot: Initialising shared state...
+2026-06-23 04:19:12.237  INFO sniper_bot::market_fetcher: 🎯 SNIPER SCOPE: targeting ACTIVE 15m window starting at 2026-06-23 04:15:00 UTC
+2026-06-23 04:19:12.237  INFO sniper_bot::market_fetcher: Fetching Gamma API for slug: `btc-updown-15m-1782188100`
+2026-06-23 04:19:12.266  WARN sniper_bot::market_fetcher: Primary slug `btc-updown-15m-1782188100` not found — trying fallback `bitcoin-updown-15m-1782188100`
+2026-06-23 04:19:12.266  INFO sniper_bot::market_fetcher: Fetching Gamma API for slug: `bitcoin-updown-15m-1782188100`
+2026-06-23 04:19:12.352 ERROR sniper_bot: ❌ Failed to fetch initial market. Bot starting DISARMED — will retry on the next rollover. error=No active market found for timestamp window 1782188100 (tried slugs: ["btc-updown-15m-1782188100", "bitcoin-updown-15m-1782188100"])
+2026-06-23 04:19:12.352  INFO sniper_bot: Initialising CLOB executor...
+2026-06-23 04:19:12.352  INFO sniper_bot::executor: 📄 PAPER MODE: Initialised simulated bankroll. bankroll=300.0
+2026-06-23 04:19:12.352  WARN sniper_bot::executor: PRIVATE_KEY not set — live order execution is disabled.
+2026-06-23 04:19:12.352  INFO sniper_bot::situation_room: Starting SituationRoom heuristics background loop (500 ms cadence).
+2026-06-23 04:19:12.352  INFO sniper_bot: SituationRoom heuristics loop spawned.
+2026-06-23 04:19:12.352  INFO sniper_bot: Polymarket WS task spawned. url=wss://ws-subscriptions-clob.polymarket.com/ws/market
+2026-06-23 04:19:12.352  INFO sniper_bot: Binance aggTrade WS task spawned. url=wss://stream.binance.com:9443/ws/btcusdt@aggTrade
+2026-06-23 04:19:12.352  INFO sniper_bot: Global position manager task spawned.
+2026-06-23 04:19:12.352  INFO sniper_bot: ✅ Bot is LIVE. All background tasks running. Listening for momentum events...
+2026-06-23 04:19:12.352  INFO sniper_bot:    Press Ctrl+C or send SIGTERM to initiate graceful shutdown.
+2026-06-23 04:19:12.352  INFO sniper_bot::streams: Polymarket stream task started. URL: wss://ws-subscriptions-clob.polymarket.com/ws/market
+2026-06-23 04:19:12.352  INFO sniper_bot::executor: 🏦 Global Position Manager started.
+2026-06-23 04:19:12.352  INFO sniper_bot::streams: Binance stream task started. URL: wss://stream.binance.com:9443/ws/btcusdt@aggTrade
+2026-06-23 14:05:23.344  INFO sniper_bot: 📴 SIGTERM received — initiating graceful shutdown...
+2026-06-23 14:05:23.344  WARN sniper_bot: Sniper Bot shutting down. Any open positions will NOT be automatically closed.
+2026-06-23 14:05:23.344  WARN sniper_bot: Review open positions manually via the Polymarket UI or scripts/check_portfolio.py.
+2026-06-23 14:05:23.344  INFO sniper_bot: 👋 Shutdown complete. Goodbye. total_uptime_sec=35171
