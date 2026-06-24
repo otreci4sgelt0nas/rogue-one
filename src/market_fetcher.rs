@@ -47,14 +47,49 @@ struct GammaEvent {
 struct GammaMarket {
     id: Option<String>,
 
-    /// JSON-encoded array of CLOB token IDs, e.g. `"[\"0xabc...\",\"0xdef...\"]"`.
+    /// JSON-encoded array of CLOB token IDs, e.g. `"[\"0xabc...\",\"0xdef...\"]"` .
     clob_token_ids: Option<String>,
 
-    /// Ordered list of outcome labels, e.g. `["Up","Down"]` or `["Yes","No"]`.
+    /// Outcome labels — the Gamma API returns this as either a proper JSON array
+    /// `["Up", "Down"]` OR as a JSON-encoded string `"[\"Up\", \"Down\"]"`,
+    /// so we use a custom deserialiser that handles both forms.
+    #[serde(default, deserialize_with = "deser_string_or_vec::deserialize")]
     outcomes: Option<Vec<String>>,
 
     /// UMA condition ID used for on-chain redemption after settlement.
     condition_id: Option<String>,
+}
+
+/// Custom Serde deserialiser: accepts both a native JSON string-array
+/// `["Up", "Down"]` **and** a JSON-encoded string `"[\"Up\", \"Down\"]"`,
+/// returning `Option<Vec<String>>` in both cases.
+///
+/// The Polymarket Gamma API has historically returned `outcomes` as a
+/// JSON-encoded string rather than a proper array. Using `serde_json::Value`
+/// as an intermediate avoids a hard type-mismatch error that would otherwise
+/// silently treat the whole market as "not found".
+mod deser_string_or_vec {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D>(de: D) -> Result<Option<Vec<String>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt: Option<serde_json::Value> = Option::deserialize(de)?;
+        Ok(match opt {
+            None => None,
+            Some(serde_json::Value::Array(arr)) => Some(
+                arr.into_iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            ),
+            Some(serde_json::Value::String(s)) => {
+                // E.g. "[\"Up\", \"Down\"]" — parse inner JSON.
+                Some(serde_json::from_str::<Vec<String>>(&s).unwrap_or_default())
+            }
+            _ => None,
+        })
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

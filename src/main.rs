@@ -62,11 +62,13 @@ mod state;
 mod streams;
 
 // ── Selective imports ─────────────────────────────────────────────────────────
+use std::sync::atomic::Ordering;
+
 use config::CONFIG;
 use executor::ClobExecutor;
 use market_fetcher::MarketFetcher;
 use situation_room::SituationRoom;
-use state::SharedState;
+use state::{compute_next_expiry, unix_now_secs, SharedState};
 use streams::{run_binance_stream, run_polymarket_stream};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,7 +168,20 @@ async fn main() {
             error!(
                 error = %e,
                 "❌ Failed to fetch initial market. Bot starting DISARMED — \
-                 will retry on the next rollover."
+                 will retry on rollover."
+            );
+            // Set market_expiry to the next window boundary so that
+            // is_market_expired() fires when that time arrives, triggering
+            // handle_rollover() which will re-fetch the market and re-arm.
+            // Without this, market_expiry stays 0 and the expiry guard
+            // (expiry > 0) never triggers — the bot stays DISARMED forever.
+            let now         = unix_now_secs() as u64;
+            let next_expiry = compute_next_expiry(now, CONFIG.market_window_sec());
+            state.market_expiry.store(next_expiry, Ordering::Release);
+            info!(
+                next_expiry = next_expiry,
+                "📅 market_expiry set to next window boundary — \
+                 rollover will fire and re-arm at that time."
             );
         }
     }
