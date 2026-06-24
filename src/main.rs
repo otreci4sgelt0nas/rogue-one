@@ -55,6 +55,7 @@ use tracing_subscriber::{
 mod config;
 mod errors;
 mod executor;
+mod live_trading;
 mod market_fetcher;
 mod situation_room;
 mod sniper;     // kept for tests; SniperBrain is not used directly in main
@@ -194,6 +195,63 @@ async fn main() {
     //                 first iteration of the position manager.
     info!("Initialising CLOB executor...");
     let executor = ClobExecutor::new(Arc::clone(&state));
+
+    // ── Step 6b: Fetch live bankroll immediately ──────────────────────────────
+    // In live mode, bankroll starts at 0.0 and must be fetched from on-chain
+    // USDC before the first tick fires — otherwise the first momentum event
+    // will be rejected with "bankroll too low".
+    // We do this here synchronously (awaited) so the sniper never sees $0.
+    if !CONFIG.paper_mode {
+        if let Some(signer) = executor.signer.as_ref() {
+            if !CONFIG.poly_rpc_url.is_empty() {
+                info!("💰 Fetching initial live bankroll from on-chain USDC...");
+                match crate::live_trading::get_usdc_balance(
+                    &executor.http,
+                    &CONFIG.poly_rpc_url,
+                    &signer.wallet_address,
+                )
+                .await
+                {
+                    Ok(usdc) => {
+                        executor.bankroll.store(usdc, std::sync::atomic::Ordering::Release);
+                        info!(bankroll = usdc, "✅ Live bankroll initialised from on-chain USDC.");
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "⚠️  Could not fetch on-chain USDC balance at startup. \
+                             Bot will retry in 60s via position manager. \
+                             Set STARTING_BANKROLL in .env as a fallback."
+                        );
+                        // Fallback: use STARTING_BANKROLL from config so the bot
+                        // isn't completely blind. The reconciler will correct it
+                        // within 60 seconds.
+                        if CONFIG.starting_bankroll > 0.0 {
+                            executor.bankroll.store(
+                                CONFIG.starting_bankroll,
+                                std::sync::atomic::Ordering::Release,
+                            );
+                            warn!(
+                                fallback = CONFIG.starting_bankroll,
+                                "⚠️  Using STARTING_BANKROLL as temporary fallback bankroll."
+                            );
+                        }
+                    }
+                }
+            } else {
+                warn!(
+                    "POLY_RPC_URL not set — cannot fetch on-chain bankroll. \
+                     Falling back to STARTING_BANKROLL={}", CONFIG.starting_bankroll
+                );
+                if CONFIG.starting_bankroll > 0.0 {
+                    executor.bankroll.store(
+                        CONFIG.starting_bankroll,
+                        std::sync::atomic::Ordering::Release,
+                    );
+                }
+            }
+        }
+    }
 
     // ── Step 7: Spawn SituationRoom heuristics loop ───────────────────────────
     // Runs every 500 ms on a dedicated tokio task.  Reads the current EMA,

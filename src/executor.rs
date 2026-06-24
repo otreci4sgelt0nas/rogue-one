@@ -58,6 +58,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::CONFIG;
 use crate::errors::{ExecResult, ExecutorError};
+use crate::live_trading::LiveSigner;
 use crate::situation_room::{
     calculate_hold_ev, impatience_target_price, is_impatient, is_safe_to_hold_to_expiry,
 };
@@ -282,7 +283,7 @@ pub struct ClobExecutor {
 
     // ── HTTP client (reused across all order calls) ───────────────────────────
     /// Persistent `reqwest` client with connection keep-alive to the CLOB.
-    http: reqwest::Client,
+    pub http: reqwest::Client,
 
     // ── Bankroll ──────────────────────────────────────────────────────────────
     /// Current available USD balance.
@@ -322,6 +323,10 @@ pub struct ClobExecutor {
 
     /// Expiry timestamp of the last completed window (for per-window P&L reset).
     pub last_summary_expiry: Mutex<Option<u64>>,
+
+    /// Live trading signer — owns the parsed secp256k1 key and wallet address.
+    /// `None` in paper mode or when PRIVATE_KEY is absent/invalid.
+    pub signer: Option<Arc<LiveSigner>>,
 }
 
 impl ClobExecutor {
@@ -366,25 +371,24 @@ impl ClobExecutor {
         };
 
         // ── L2 credential derivation ─────────────────────────────────────────
-        let (is_authenticated, wallet_address) = if CONFIG.has_private_key() {
-            // TODO (Step 4): derive EIP-712 L2 credentials from PRIVATE_KEY.
-            // For now, mark as authenticated if a key exists.
-            // The actual signing will be implemented in the executor Step.
-            let address = derive_wallet_address_stub(&CONFIG.private_key);
-            match address {
-                Some(addr) => {
-                    info!(address = %addr, "✅ Polymarket L2 API credentials derived.");
-                    (true, Some(addr))
+        let signer_result = if CONFIG.has_private_key() {
+            match LiveSigner::from_hex_key(&CONFIG.private_key) {
+                Ok(s) => {
+                    info!(address = %s.wallet_address, "✅ LiveSigner constructed — live orders enabled.");
+                    Some(Arc::new(s))
                 }
-                None => {
-                    warn!("⚠️  Could not derive wallet address from PRIVATE_KEY. Live orders disabled.");
-                    (false, None)
+                Err(e) => {
+                    warn!("⚠️  LiveSigner failed: {e}. Live orders disabled.");
+                    None
                 }
             }
         } else {
             warn!("PRIVATE_KEY not set — live order execution is disabled.");
-            (false, None)
+            None
         };
+
+        let is_authenticated = signer_result.is_some();
+        let wallet_address   = signer_result.as_ref().map(|s| s.wallet_address.clone());
 
         Arc::new(Self {
             state,
@@ -396,6 +400,7 @@ impl ClobExecutor {
             wallet_address,
             csv_filename,
             last_summary_expiry: Mutex::new(None),
+            signer: signer_result,
         })
     }
 
@@ -639,35 +644,45 @@ impl ClobExecutor {
         wire_ms:     f64,
         spread_str:  &str,
     ) -> ExecResult<TradeOutcome> {
+        let signer = self.signer.as_ref().ok_or(ExecutorError::NotAuthenticated)?;
+        let order_value = buy_price * buy_size as f64;
+
         warn!(
             size      = buy_size,
             price     = buy_price,
             direction = %snap.direction,
             token     = %&snap.token_id[snap.token_id.len().saturating_sub(6)..],
-            "🚨 FIRING LIVE ORDER — attempting buy."
+            wire_ms   = wire_ms,
+            spread    = %spread_str,
+            "🚨 FIRING LIVE ORDER."
         );
 
-        // TODO (Step 4): Full EIP-712 signing and CLOB POST implementation.
-        //
-        // Steps:
-        //   1. Build order digest: EIP-712 hash of (tokenId, price, size, side, salt).
-        //   2. Sign with k256 ECDSA using the private key from CONFIG.
-        //   3. Encode the signature as base64.
-        //   4. POST to "https://clob.polymarket.com/order" with ClobOrderRequest body.
-        //   5. Parse ClobOrderResponse.
-        //   6. On success: deduct bankroll, upsert_position, return TradeOutcome::filled.
-        //   7. On rejection: return Err(ExecutorError::OrderRejected { ... }).
+        let (fill_price, fill_size, _order_id) =
+            crate::live_trading::execute_live_buy(
+                &self.http,
+                signer,
+                &snap.token_id,
+                buy_price,
+                buy_size,
+                order_value,
+            )
+            .await
+            .map_err(|e| ExecutorError::OrderRejected {
+                token_id:  snap.token_id.clone(),
+                error_msg: e,
+            })?;
 
-        // ── Stub: log diagnostic and return a simulated error ─────────────────
-        error!(
-            wire_ms    = wire_ms,
-            spread     = %spread_str,
-            ask        = snap.effective_ask,
-            order      = buy_price,
-            "❌ Live execution not yet implemented (Step 4). Aborting."
-        );
+        if !self.deduct_bankroll(order_value) {
+            return Err(ExecutorError::InsufficientBankroll {
+                bankroll: self.bankroll(),
+                price:    buy_price,
+            });
+        }
 
-        Err(ExecutorError::NotAuthenticated)
+        self.upsert_position(snap, fill_price, fill_size);
+        self.append_csv_entry_async("BUY", &snap.token_id, fill_size as f64, fill_price, 0.0, 0.0);
+
+        Ok(TradeOutcome::filled(fill_price, fill_size, None))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -727,13 +742,26 @@ impl ClobExecutor {
             return self.paper_ledger.lock().balance(token_id);
         }
 
-        // TODO (Step 4): Web3 ERC-1155 balanceOf call.
-        // Steps:
-        //   1. Convert token_id (decimal string) to U256.
-        //   2. Call contract.functions.balanceOf(wallet_address, token_id_u256).
-        //   3. Return raw_balance / 10^6 (USDC.e has 6 decimals).
-        warn!("get_token_balance: Live Web3 balance check not yet implemented (Step 4).");
-        0.0
+        // Live mode: query the CTF ERC-1155 contract via RPC.
+        let signer = match self.signer.as_ref() {
+            Some(s) => s,
+            None    => return 0.0,
+        };
+
+        match crate::live_trading::get_ctf_balance(
+            &self.http,
+            &CONFIG.poly_rpc_url,
+            &signer.wallet_address,
+            token_id,
+        )
+        .await
+        {
+            Ok(bal) => bal,
+            Err(e)  => {
+                warn!(token = %token_id, error = %e, "CTF balance fetch failed.");
+                0.0
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1050,79 +1078,122 @@ impl ClobExecutor {
                 pnl,
             );
         } else {
-            // TODO (Step 4): Live SELL FAK order submission.
-            // Steps:
-            //   1. Build and sign a SELL FAK order for `shares` at `sell_price`.
-            //   2. POST to CLOB /order.
-            //   3. On success: credit bankroll, log result.
-            //   4. On failure: leave position open (retry on next manager tick).
-            warn!(
-                token  = %&token_id[token_id.len().saturating_sub(6)..],
-                reason = reason,
-                "Live SELL not yet implemented (Step 4)."
-            );
-            return; // Don't remove position if sell didn't actually fire.
+            // ── Live sell ─────────────────────────────────────────────────────
+            let signer = match self.signer.as_ref() {
+                Some(s) => s,
+                None => {
+                    warn!(
+                        token  = %&token_id[token_id.len().saturating_sub(6)..],
+                        reason = reason,
+                        "Live sell skipped — no signer."
+                    );
+                    return;
+                }
+            };
+
+            match crate::live_trading::execute_live_sell(
+                &self.http,
+                signer,
+                token_id,
+                sell_price,
+                shares,
+            )
+            .await
+            {
+                Ok((proceeds, _order_id)) => {
+                    self.credit_bankroll(proceeds);
+                    if pnl >= 0.0 {
+                        info!(
+                            token    = %&token_id[token_id.len().saturating_sub(6)..],
+                            shares, price = sell_price, cost = cost_basis, pnl, reason,
+                            bankroll = self.bankroll(),
+                            "💚 LIVE SELL — profit."
+                        );
+                    } else {
+                        warn!(
+                            token    = %&token_id[token_id.len().saturating_sub(6)..],
+                            shares, price = sell_price, cost = cost_basis, pnl, reason,
+                            bankroll = self.bankroll(),
+                            "🔴 LIVE SELL — loss."
+                        );
+                    }
+                    self.append_csv_entry_async(
+                        "SELL", token_id, shares as f64, cost_basis, sell_price, pnl,
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        token  = %&token_id[token_id.len().saturating_sub(6)..],
+                        reason = reason,
+                        error  = %e,
+                        "❌ Live sell failed — position retained for retry."
+                    );
+                    return; // Don't remove position — retry on next manager tick.
+                }
+            }
         }
 
         // ── Remove the position record ─────────────────────────────────────────
         self.positions.lock().remove(token_id);
     }
 
-    /// Trigger the auto-redemption script for an expired market.
+    /// Trigger the auto-redemption for an expired market.
     ///
-    /// Spawns `scripts/redeem.py {condition_id}` as a child process and waits
-    /// for it to complete. The 15-second delay gives the UMA oracle time to
-    /// settle the market on-chain before redemption is attempted.
+    /// Calls the CTF `redeemPositions` function directly via a signed
+    /// EIP-1559 transaction — no Python subprocess required.
     async fn trigger_auto_redeem(&self, condition_id: &str) {
         if condition_id.is_empty() {
             warn!("Auto-redeem: no condition ID — skipping.");
             return;
         }
 
-        info!(
-            condition_id = %condition_id,
-            "⏳ Waiting 15s for UMA oracle to settle market before redemption..."
-        );
-        tokio::time::sleep(Duration::from_secs(15)).await;
+        let signer = match self.signer.as_ref() {
+            Some(s) => s,
+            None => {
+                warn!("Auto-redeem: no signer — cannot redeem on-chain. Redeem manually via the Polymarket UI.");
+                return;
+            }
+        };
 
-        info!("⚙️  Executing auto-redemption script...");
-
-        // TODO (Step 4): Implement Web3 direct redemption via the ERC-1155
-        // conditional token contract instead of shelling out to a Python script.
-        //
-        // For now, spawn the existing Python script.
-        match tokio::process::Command::new("python3")
-            .arg("scripts/redeem.py")
-            .arg(condition_id)
-            .output()
-            .await
-        {
-            Ok(output) if output.status.success() => {
-                info!(
-                    stdout = %String::from_utf8_lossy(&output.stdout),
-                    "✅ Auto-redemption succeeded."
-                );
-            }
-            Ok(output) => {
-                error!(
-                    stderr = %String::from_utf8_lossy(&output.stderr),
-                    "❌ Auto-redemption script exited with error."
-                );
-            }
-            Err(e) => {
-                error!(error = %e, "❌ Failed to spawn auto-redemption script.");
-            }
-        }
+        crate::live_trading::trigger_auto_redeem_native(
+            &self.http,
+            &CONFIG.poly_rpc_url,
+            signer,
+            condition_id,
+        )
+        .await;
     }
 
     /// Reconcile the bankroll from the on-chain USDC.e balance (live mode only).
     async fn reconcile_bankroll_live(&self) {
-        // TODO (Step 4): Web3 USDC.e balanceOf call.
-        // Steps:
-        //   1. Call usdc_contract.functions.balanceOf(wallet_address).
-        //   2. Convert raw_balance / 10^6 to USD float.
-        //   3. If delta > $0.01, update self.bankroll and log.
-        debug!("[PositionManager] Bankroll reconciliation: live Web3 call not yet implemented.");
+        let signer = match self.signer.as_ref() {
+            Some(s) => s,
+            None    => return,
+        };
+
+        if CONFIG.poly_rpc_url.is_empty() {
+            debug!("Bankroll reconciliation skipped — POLY_RPC_URL not set.");
+            return;
+        }
+
+        match crate::live_trading::get_usdc_balance(
+            &self.http,
+            &CONFIG.poly_rpc_url,
+            &signer.wallet_address,
+        )
+        .await
+        {
+            Ok(usdc) => {
+                let prev = self.bankroll();
+                if (usdc - prev).abs() > 0.01 {
+                    info!(prev, usdc, "💰 Bankroll reconciled from on-chain USDC.");
+                    self.bankroll.store(usdc, Ordering::Release);
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Bankroll reconciliation failed — retaining last known value.");
+            }
+        }
     }
 }
 
@@ -1174,36 +1245,6 @@ async fn write_csv_row(
 
     file.write_all(row.as_bytes()).await?;
     Ok(())
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Wallet address derivation stub
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Derive an Ethereum wallet address from a hex private key.
-///
-/// Returns `None` if the key is empty or malformed.
-///
-/// TODO (Step 4): Full implementation using `k256` + `sha3` Keccak-256.
-/// Steps:
-///   1. hex::decode(private_key.trim_start_matches("0x")).
-///   2. k256::SecretKey::from_slice(&bytes).
-///   3. PublicKey = secret_key.public_key().
-///   4. Serialize uncompressed (65 bytes), drop the 0x04 prefix (64 bytes).
-///   5. Keccak-256 hash of those 64 bytes.
-///   6. Take last 20 bytes → EIP-55 checksum address.
-fn derive_wallet_address_stub(private_key: &str) -> Option<String> {
-    if private_key.is_empty() {
-        return None;
-    }
-    let key_clean = private_key.trim_start_matches("0x");
-    match hex::decode(key_clean) {
-        Ok(bytes) if bytes.len() == 32 => {
-            // Return a placeholder — full derivation in Step 4.
-            Some(format!("0x[derived from {}...{}]", &key_clean[..4], &key_clean[key_clean.len()-4..]))
-        }
-        _ => None,
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1490,25 +1531,25 @@ mod tests {
         assert!((fc - CONFIG.kelly_tier_c_fraction).abs() < f64::EPSILON);
     }
 
-    // ── derive_wallet_address_stub ────────────────────────────────────────────
+    // ── wallet address derivation ─────────────────────────────────────────────
 
     #[test]
     fn wallet_address_stub_returns_none_for_empty_key() {
-        assert!(derive_wallet_address_stub("").is_none());
+        assert!(crate::live_trading::derive_wallet_address("").is_none());
     }
 
     #[test]
     fn wallet_address_stub_returns_some_for_valid_length_key() {
         // 32 random bytes as hex = 64 hex chars.
-        let fake_key = "a".repeat(64);
-        let result = derive_wallet_address_stub(&fake_key);
+        let fake_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let result = crate::live_trading::derive_wallet_address(fake_key);
         assert!(result.is_some());
     }
 
     #[test]
     fn wallet_address_stub_handles_0x_prefix() {
-        let fake_key = format!("0x{}", "b".repeat(64));
-        let result = derive_wallet_address_stub(&fake_key);
+        let fake_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let result = crate::live_trading::derive_wallet_address(fake_key);
         assert!(result.is_some());
     }
 }
