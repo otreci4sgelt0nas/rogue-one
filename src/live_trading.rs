@@ -73,11 +73,17 @@ use tracing::{error, info, warn};
 /// Polymarket CLOB REST endpoint for order submission.
 pub const CLOB_ORDER_URL: &str = "https://clob.polymarket.com/order";
 
-/// Polygon Mainnet USDC.e contract (6 decimals).
-pub const USDC_CONTRACT: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+/// Polymarket pUSD (Proxy USDC) collateral token on Polygon Mainnet (V2).
+pub const USDC_CONTRACT: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
 
 /// Polymarket CTF (ERC-1155 conditional tokens) contract on Polygon.
 pub const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+
+/// Polymarket CTF Exchange (Standard markets) — V2 contract address.
+pub const CTF_EXCHANGE_STANDARD: &str = "0xE111180000d2663C0091e4f400237545B87B996B";
+
+/// Polymarket CTF Exchange (NegRisk / Up-Down markets) — V2 contract address.
+pub const CTF_EXCHANGE_NEG_RISK: &str  = "0xe2222d279d744050d28e00520010520000310F59";
 
 /// EIP-712 chain ID for Polygon mainnet.
 pub const POLYGON_CHAIN_ID: u64 = 137;
@@ -140,34 +146,26 @@ impl LiveSigner {
     // Per-order EIP-712 signature (embedded in JSON body)
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Sign the Polymarket order struct hash and return a base64-encoded
-    /// 65-byte `[r(32) | s(32) | v(1)]` signature.
+    /// Sign a Polymarket CLOB order using EIP-712 typed data (V2 spec).
     ///
-    /// Polymarket's order struct (EIP-712):
+    /// V2 Order struct (taker, nonce, feeRateBps removed vs V1):
     /// ```text
     /// Order {
-    ///   maker:     address
-    ///   taker:     address   (zero address for public orders)
-    ///   tokenId:   uint256
-    ///   makerAmount: uint256
-    ///   takerAmount: uint256
-    ///   side:      uint8     (0=BUY, 1=SELL)
-    ///   expiration: uint256  (0 = no expiry / FAK)
-    ///   nonce:     uint256
-    ///   feeRateBps: uint256  (0 for taker orders)
-    ///   signatureType: uint8 (0 = EOA ECDSA)
+    ///   salt:          uint256
+    ///   maker:         address
+    ///   signer:        address  (= maker for EOA)
+    ///   tokenId:       uint256
+    ///   makerAmount:   uint256
+    ///   takerAmount:   uint256
+    ///   expiration:    uint256  (0 = no expiry / FAK)
+    ///   side:          uint8    (0=BUY, 1=SELL)
+    ///   signatureType: uint8    (0 = EOA ECDSA)
     /// }
     /// ```
     ///
-    /// References:
-    /// - https://docs.polymarket.com/#signing-orders
-    /// - py_clob_client/clob_types.py → `OrderBuilder.build_signed_order`
-    /// Sign a Polymarket CLOB order using EIP-712 typed data.
-    ///
-    /// * `neg_risk` — pass `true` for neg-risk markets (BTC/ETH up-down, most
-    ///   binary markets on Polygon). Uses a different exchange verifying contract.
-    ///   Standard exchange: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
-    ///   Neg-risk exchange: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
+    /// * `neg_risk` — pass `true` for NegRisk (Up/Down) markets.
+    ///   Standard exchange:  `0xE111180000d2663C0091e4f400237545B87B996B`
+    ///   NegRisk exchange:   `0xe2222d279d744050d28e00520010520000310F59`
     pub fn sign_order(
         &self,
         token_id:    &str,
@@ -196,12 +194,11 @@ impl LiveSigner {
         };
 
         // ── Step 2: EIP-712 domain separator ─────────────────────────────────
-        // Domain: { name: "Polymarket CTF Exchange", version: "1",
+        // Domain: { name: "Polymarket CTF Exchange", version: "2",
         //           chainId: 137, verifyingContract: <exchange> }
         //
-        // Verified from python-order-utils/py_order_utils/builders/base_builder.py:
-        //   make_domain(name="Polymarket CTF Exchange", version="1",
-        //               chainId=str(chain_id), verifyingContract=address)
+        // V2 CRITICAL: version bumped from "1" → "2". Using "1" produces
+        // signatures that the V2 contracts will reject outright.
         let domain_type_hash: [u8; 32] = {
             let mut h = Keccak256::new();
             h.update(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
@@ -216,15 +213,15 @@ impl LiveSigner {
 
         let version_hash: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(b"1");
+            h.update(b"2");  // V2: was "1" in V1
             h.finalize().into()
         };
 
-        // Standard vs neg-risk exchange address (Polygon mainnet).
+        // V2 exchange addresses — dynamically selected by market type.
         let exchange_addr_hex = if neg_risk {
-            "0xC5d563A36AE78145C45a50134d48A1215220f80a"  // neg-risk exchange
+            CTF_EXCHANGE_NEG_RISK    // NegRisk (Up/Down) markets
         } else {
-            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  // standard exchange
+            CTF_EXCHANGE_STANDARD   // Standard binary markets
         };
         let exchange_addr_bytes = decode_address(exchange_addr_hex)?;
 
@@ -241,43 +238,36 @@ impl LiveSigner {
         };
 
         // ── Step 3: Order struct hash ─────────────────────────────────────────
-        // Correct type string (verified against py-clob-client / py-order-utils):
-        //   Order(uint256 salt, address maker, address signer, address taker,
-        //         uint256 tokenId, uint256 makerAmount, uint256 takerAmount,
-        //         uint256 expiration, uint256 nonce, uint256 feeRateBps,
-        //         uint8 side, uint8 signatureType)
-        //
-        // Key differences from naive implementation:
-        //   • `signer` field present between maker and taker
-        //   • tokenId is uint256 (not address)
-        //   • side comes BEFORE signatureType
+        // V2 Order type string — taker, nonce, and feeRateBps removed vs V1.
+        // V2: Order(uint256 salt,address maker,address signer,uint256 tokenId,
+        //           uint256 makerAmount,uint256 takerAmount,uint256 expiration,
+        //           uint8 side,uint8 signatureType)
         let order_type_hash: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)");
+            h.update(b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint8 side,uint8 signatureType)");
             h.finalize().into()
         };
 
         let maker_addr_bytes = decode_address(&self.wallet_address)?;
-        let zero_addr        = [0u8; 20];
         let token_id_u256    = token_id_to_u256(token_id)?;
         let side_u8          = side as u8;
 
         let struct_hash: [u8; 32] = {
-            // 13 fields × 32 bytes each
-            let mut enc = Vec::with_capacity(13 * 32);
+            // V2: 10 fields × 32 bytes (taker, nonce, feeRateBps removed)
+            let mut enc = Vec::with_capacity(10 * 32);
             enc.extend_from_slice(&order_type_hash);
-            enc.extend_from_slice(&pad_u256(salt as u128));       // salt
+            enc.extend_from_slice(&pad_u256(salt as u128));        // salt
             enc.extend_from_slice(&pad_address(&maker_addr_bytes)); // maker
             enc.extend_from_slice(&pad_address(&maker_addr_bytes)); // signer = maker (EOA)
-            enc.extend_from_slice(&pad_address(&zero_addr));       // taker = zero address
-            enc.extend_from_slice(&token_id_u256);                 // tokenId (uint256)
-            enc.extend_from_slice(&pad_u256(maker_amount));        // makerAmount
-            enc.extend_from_slice(&pad_u256(taker_amount));        // takerAmount
-            enc.extend_from_slice(&pad_u256(0));                   // expiration = 0 (FAK)
-            enc.extend_from_slice(&pad_u256(0));                   // nonce = 0
-            enc.extend_from_slice(&pad_u256(0));                   // feeRateBps = 0
-            enc.extend_from_slice(&pad_u256(side_u8 as u128));    // side  ← before signatureType
-            enc.extend_from_slice(&pad_u256(0));                   // signatureType = 0 (EOA)
+            // ❌ V1 had: taker (zero address) — REMOVED in V2
+            enc.extend_from_slice(&token_id_u256);                  // tokenId (uint256)
+            enc.extend_from_slice(&pad_u256(maker_amount));         // makerAmount
+            enc.extend_from_slice(&pad_u256(taker_amount));         // takerAmount
+            enc.extend_from_slice(&pad_u256(0));                    // expiration = 0 (FAK)
+            // ❌ V1 had: nonce = 0        — REMOVED in V2
+            // ❌ V1 had: feeRateBps = 0   — REMOVED in V2
+            enc.extend_from_slice(&pad_u256(side_u8 as u128));     // side
+            enc.extend_from_slice(&pad_u256(0));                    // signatureType = 0 (EOA)
             let mut h = Keccak256::new();
             h.update(&enc);
             h.finalize().into()
@@ -364,19 +354,19 @@ pub enum Side {
 // CLOB HTTP request / response types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// JSON body sent to `POST /order`.
+/// Inner order object nested inside `ClobOrderPayload`.
+///
+/// V2: `taker`, `nonce`, and `feeRateBps` fields have been removed.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-<<<<<<< HEAD
 pub struct OrderInner {
-    /// Random nonce for deduplication (integer).
+    /// Random salt for order deduplication.
     pub salt:           u64,
     /// Maker = wallet address (EIP-55 checksum).
     pub maker:          String,
     /// Signer = same as maker for EOA wallets.
     pub signer:         String,
-    /// Taker = zero address (open order).
-    pub taker:          String,
+    // ❌ V1 had: taker (zero address) — removed in V2
     /// Conditional token ID (decimal string).
     pub token_id:       String,
     /// USDC micro-units the maker sends (decimal string).
@@ -385,30 +375,26 @@ pub struct OrderInner {
     pub taker_amount:   String,
     /// Order expiration Unix timestamp; "0" = no expiry (FAK).
     pub expiration:     String,
-    /// On-chain nonce; "0" for fresh orders.
-    pub nonce:          String,
-    /// Protocol fee in basis points; "0" for takers.
-    pub fee_rate_bps:   String,
-    /// "BUY" or "SELL" string (as returned by py-order-utils SignedOrder.dict()).
+    // ❌ V1 had: nonce      — removed in V2
+    // ❌ V1 had: feeRateBps — removed in V2
+    /// "BUY" or "SELL".
     pub side:           String,
     /// 0 = EOA (direct private-key signature).
-=======
-pub struct OrderRequest {
-    pub token_id:   String,
-    pub price:      f64,
-    pub size:       u64,
-    pub side:       &'static str,   // "BUY" or "SELL"
-    pub order_type: &'static str,   // "FAK"
-    pub signature:  String,
-    pub signer:     String,
-    pub salt:       u64,
-    pub maker_amount: u128,
-    pub taker_amount: u128,
-    pub expiration:   u64,          // 0 = no expiry (FAK)
-    pub nonce:        u64,
-    pub fee_rate_bps: u64,
->>>>>>> parent of 9d6c55d (fix: restructure CLOB order payload to match Polymarket API (nested order object with maker/taker fields))
     pub signature_type: u8,
+    /// 0x-prefixed hex ECDSA signature of the EIP-712 order digest.
+    pub signature:      String,
+}
+
+/// Top-level JSON body sent to `POST /order`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClobOrderPayload {
+    /// The signed order object.
+    pub order:      OrderInner,
+    /// Owner = maker wallet address.
+    pub owner:      String,
+    /// Order type: "FAK" (Fill-and-Kill / marketable limit order).
+    pub order_type: String,
 }
 
 /// JSON response from `POST /order`.
@@ -460,42 +446,23 @@ pub async fn execute_live_buy(
     let maker_amount = ((buy_price * buy_size as f64) * usdc_scale as f64) as u128;
     let taker_amount = buy_size as u128 * usdc_scale;
 
-<<<<<<< HEAD
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt:           salt,
+            salt,
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
-            taker:          "0x0000000000000000000000000000000000000000".to_string(),
+            // V2: taker field removed
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             expiration:     "0".to_string(),
-            nonce:          "0".to_string(),
-            fee_rate_bps:   "0".to_string(),
+            // V2: nonce and fee_rate_bps fields removed
             side:           "BUY".to_string(),
             signature_type: 0,
             signature:      sig,
         },
         owner:      signer.wallet_address.clone(),
         order_type: "FAK".to_string(),
-=======
-    let body = OrderRequest {
-        token_id:       token_id.to_string(),
-        price:          buy_price,
-        size:           buy_size,
-        side:           "BUY",
-        order_type:     "FAK",
-        signature:      sig,
-        signer:         signer.wallet_address.clone(),
-        salt,
-        maker_amount,
-        taker_amount,
-        expiration:     0,
-        nonce:          0,
-        fee_rate_bps:   0,
-        signature_type: 0,
->>>>>>> parent of 9d6c55d (fix: restructure CLOB order payload to match Polymarket API (nested order object with maker/taker fields))
     };
 
     let now_ts = unix_ts_secs();
@@ -580,42 +547,23 @@ pub async fn execute_live_sell(
     let maker_amount = shares as u128 * usdc_scale;
     let taker_amount = ((sell_price * shares as f64) * usdc_scale as f64) as u128;
 
-<<<<<<< HEAD
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt:           salt,
+            salt,
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
-            taker:          "0x0000000000000000000000000000000000000000".to_string(),
+            // V2: taker field removed
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             expiration:     "0".to_string(),
-            nonce:          "0".to_string(),
-            fee_rate_bps:   "0".to_string(),
+            // V2: nonce and fee_rate_bps fields removed
             side:           "SELL".to_string(),
             signature_type: 0,
             signature:      sig,
         },
         owner:      signer.wallet_address.clone(),
         order_type: "FAK".to_string(),
-=======
-    let body = OrderRequest {
-        token_id:       token_id.to_string(),
-        price:          sell_price,
-        size:           shares,
-        side:           "SELL",
-        order_type:     "FAK",
-        signature:      sig,
-        signer:         signer.wallet_address.clone(),
-        salt,
-        maker_amount,
-        taker_amount,
-        expiration:     0,
-        nonce:          0,
-        fee_rate_bps:   0,
-        signature_type: 0,
->>>>>>> parent of 9d6c55d (fix: restructure CLOB order payload to match Polymarket API (nested order object with maker/taker fields))
     };
 
     let now_ts = unix_ts_secs();
