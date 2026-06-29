@@ -286,7 +286,8 @@ impl LiveSigner {
         raw_sig[32..64].copy_from_slice(&sig.s().to_bytes());
         raw_sig[64] = 27 + recid.to_byte();
 
-        Ok(B64.encode(raw_sig))
+        // Polymarket CLOB expects the signature as a 0x-prefixed hex string (130 hex chars).
+        Ok(format!("0x{}", hex::encode(raw_sig)))
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -327,7 +328,7 @@ impl LiveSigner {
         raw[32..64].copy_from_slice(&sig.s().to_bytes());
         raw[64] = 27 + recid.to_byte();
 
-        Ok(hex::encode(raw))
+        Ok(format!("0x{}", hex::encode(raw)))
     }
 }
 
@@ -350,8 +351,8 @@ pub enum Side {
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderInner {
-    /// Random nonce for deduplication (decimal string).
-    pub salt:           String,
+    /// Random nonce for deduplication (integer).
+    pub salt:           u64,
     /// Maker = wallet address (EIP-55 checksum).
     pub maker:          String,
     /// Signer = same as maker for EOA wallets.
@@ -440,7 +441,7 @@ pub async fn execute_live_buy(
 
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt:           salt.to_string(),
+            salt:           salt,
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
             taker:          "0x0000000000000000000000000000000000000000".to_string(),
@@ -543,7 +544,7 @@ pub async fn execute_live_sell(
 
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt:           salt.to_string(),
+            salt:           salt,
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
             taker:          "0x0000000000000000000000000000000000000000".to_string(),
