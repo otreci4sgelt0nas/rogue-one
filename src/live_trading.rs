@@ -196,13 +196,27 @@ impl LiveSigner {
         };
 
         // ── Step 2: EIP-712 domain separator ─────────────────────────────────
-        // Polymarket's exchange contract domain uses ONLY chainId + verifyingContract.
-        // (No `name` or `version` — confirmed from py-clob-client source.)
+        // Domain: { name: "Polymarket CTF Exchange", version: "1",
+        //           chainId: 137, verifyingContract: <exchange> }
         //
-        //   keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
+        // Verified from python-order-utils/py_order_utils/builders/base_builder.py:
+        //   make_domain(name="Polymarket CTF Exchange", version="1",
+        //               chainId=str(chain_id), verifyingContract=address)
         let domain_type_hash: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(b"EIP712Domain(uint256 chainId,address verifyingContract)");
+            h.update(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+            h.finalize().into()
+        };
+
+        let name_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"Polymarket CTF Exchange");
+            h.finalize().into()
+        };
+
+        let version_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"1");
             h.finalize().into()
         };
 
@@ -215,8 +229,10 @@ impl LiveSigner {
         let exchange_addr_bytes = decode_address(exchange_addr_hex)?;
 
         let domain_separator: [u8; 32] = {
-            let mut enc = Vec::with_capacity(3 * 32);
+            let mut enc = Vec::with_capacity(5 * 32);
             enc.extend_from_slice(&domain_type_hash);
+            enc.extend_from_slice(&name_hash);
+            enc.extend_from_slice(&version_hash);
             enc.extend_from_slice(&pad_u256(POLYGON_CHAIN_ID as u128));
             enc.extend_from_slice(&pad_address(&exchange_addr_bytes));
             let mut h = Keccak256::new();
@@ -373,8 +389,8 @@ pub struct OrderInner {
     pub nonce:          String,
     /// Protocol fee in basis points; "0" for takers.
     pub fee_rate_bps:   String,
-    /// 0 = BUY, 1 = SELL (integer, not string).
-    pub side:           u8,
+    /// "BUY" or "SELL" string (as returned by py-order-utils SignedOrder.dict()).
+    pub side:           String,
     /// 0 = EOA (direct private-key signature).
     pub signature_type: u8,
     /// Base-64 encoded 65-byte [r|s|v] EIP-712 signature.
@@ -454,7 +470,7 @@ pub async fn execute_live_buy(
             expiration:     "0".to_string(),
             nonce:          "0".to_string(),
             fee_rate_bps:   "0".to_string(),
-            side:           Side::Buy as u8,   // 0 = BUY
+            side:           "BUY".to_string(),
             signature_type: 0,
             signature:      sig,
         },
@@ -558,7 +574,7 @@ pub async fn execute_live_sell(
             expiration:     "0".to_string(),
             nonce:          "0".to_string(),
             fee_rate_bps:   "0".to_string(),
-            side:           Side::Sell as u8,  // 1 = SELL
+            side:           "SELL".to_string(),
             signature_type: 0,
             signature:      sig,
         },
