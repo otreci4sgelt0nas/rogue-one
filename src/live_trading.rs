@@ -73,8 +73,17 @@ use tracing::{error, info, warn};
 /// Polymarket CLOB REST endpoint for order submission.
 pub const CLOB_ORDER_URL: &str = "https://clob.polymarket.com/order";
 
-/// Polymarket pUSD (Proxy USDC) collateral token on Polygon Mainnet (V2).
+/// Polymarket pUSD (Proxy USDC) — V2 collateral token on Polygon Mainnet.
+/// Used for on-chain approvals and as the target balance for V2 orders.
 pub const USDC_CONTRACT: &str = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB";
+
+/// Bridged USDC.e — legacy Polymarket V1 collateral, still commonly held in wallets.
+/// Checked alongside pUSD when reading bankroll so the bot works during migration.
+pub const USDC_E_CONTRACT: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
+
+/// Native USDC on Polygon (Circle's canonical contract, 6 decimals).
+/// Also checked during bankroll reads as a fallback.
+pub const USDC_NATIVE_CONTRACT: &str = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359";
 
 /// Polymarket CTF (ERC-1155 conditional tokens) contract on Polygon.
 pub const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
@@ -646,18 +655,40 @@ pub async fn get_usdc_balance(
     rpc_url:        &str,
     wallet_address: &str,
 ) -> Result<f64, String> {
-    // Encode: balanceOf(address wallet)
+    // Query all three stablecoin contracts that Polymarket may use as collateral:
+    //   1. pUSD  — V2 primary collateral
+    //   2. USDC.e — V1 legacy bridged USDC (most wallets still hold this)
+    //   3. Native USDC — Circle's canonical Polygon USDC
+    // We sum all non-zero balances so the bankroll is correct regardless of
+    // which token(s) the wallet holds during and after the V1→V2 migration.
     let addr_bytes = decode_address(wallet_address)?;
     let mut calldata = Vec::with_capacity(36);
     calldata.extend_from_slice(&BALANCE_OF_SELECTOR);
     calldata.extend_from_slice(&pad_address(&addr_bytes));
 
-    let result = eth_call(http, rpc_url, USDC_CONTRACT, &calldata).await?;
+    let contracts = [
+        (USDC_CONTRACT,        "pUSD"),
+        (USDC_E_CONTRACT,      "USDC.e"),
+        (USDC_NATIVE_CONTRACT, "USDC"),
+    ];
 
-    // USDC.e returns a uint256 in the 32-byte ABI-encoded result.
-    let raw = decode_u256_result(&result)?;
-    // USDC.e has 6 decimals.
-    Ok(raw as f64 / 1_000_000.0)
+    let mut total = 0.0f64;
+    for (contract, label) in contracts {
+        match eth_call(http, rpc_url, contract, &calldata).await {
+            Ok(result) => match decode_u256_result(&result) {
+                Ok(raw) if raw > 0 => {
+                    let bal = raw as f64 / 1_000_000.0;
+                    tracing::debug!(contract = label, balance = bal, "💵 Stablecoin balance found.");
+                    total += bal;
+                }
+                Ok(_) => {} // zero balance — skip
+                Err(e) => tracing::warn!(contract = label, error = %e, "Balance decode failed."),
+            },
+            Err(e) => tracing::warn!(contract = label, error = %e, "eth_call failed for stablecoin."),
+        }
+    }
+
+    Ok(total)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
