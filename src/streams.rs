@@ -382,6 +382,7 @@ fn build_trigger_snapshot(
         Direction::Down => market.token_id_down.clone(),
     };
     let market_slug  = market.market_slug.clone();
+    let neg_risk     = market.neg_risk;
     let ev_breakdown = state.ev_breakdown(direction);
 
     Some(TriggerSnapshot {
@@ -396,6 +397,7 @@ fn build_trigger_snapshot(
         max_price,
         spread,
         ev_breakdown,
+        neg_risk,
     })
 }
 

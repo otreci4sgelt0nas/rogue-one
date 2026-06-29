@@ -108,6 +108,10 @@ pub struct Position {
 
     /// UMA condition ID for this market window (for auto-redemption).
     pub condition_id: String,
+
+    /// Whether this position's market is a neg-risk market (affects EIP-712
+    /// exchange contract address used for signing sell orders).
+    pub neg_risk: bool,
 }
 
 impl Position {
@@ -119,6 +123,7 @@ impl Position {
         direction:   Direction,
         market_slug: String,
         condition_id: String,
+        neg_risk:    bool,
     ) -> Self {
         let total_spent = fill_price * fill_size as f64;
         Self {
@@ -132,6 +137,7 @@ impl Position {
             direction,
             market_slug,
             condition_id,
+            neg_risk,
         }
     }
 
@@ -665,6 +671,7 @@ impl ClobExecutor {
                 buy_price,
                 buy_size,
                 order_value,
+                snap.neg_risk,
             )
             .await
             .map_err(|e| ExecutorError::OrderRejected {
@@ -719,6 +726,7 @@ impl ClobExecutor {
                     snap.direction,
                     snap.market_slug.clone(),
                     condition_id,
+                    snap.neg_risk,
                 );
                 debug!(
                     token    = %&snap.token_id[snap.token_id.len().saturating_sub(6)..],
@@ -1026,10 +1034,12 @@ impl ClobExecutor {
         reason:     &'static str,
         _now_secs:  f64,
     ) {
-        // Read cost basis before removing (needed for P&L computation).
-        let cost_basis = {
+        // Read cost basis and neg_risk before removing (needed for P&L and signing).
+        let (cost_basis, neg_risk) = {
             let positions = self.positions.lock();
-            positions.get(token_id).map(|p| p.cost_basis).unwrap_or(0.0)
+            positions.get(token_id)
+                .map(|p| (p.cost_basis, p.neg_risk))
+                .unwrap_or((0.0, true)) // default neg_risk=true for btc/eth markets
         };
 
         let gross_proceeds = sell_price * shares as f64;
@@ -1097,6 +1107,7 @@ impl ClobExecutor {
                 token_id,
                 sell_price,
                 shares,
+                neg_risk,
             )
             .await
             {
@@ -1270,6 +1281,7 @@ mod tests {
             market_slug:   "btc-updown-15m-test".into(),
             condition_id:  "0xCOND".into(),
             expiry_ts:     9_999_999_999,
+            neg_risk:      true,
         };
         state.publish_market(info);
         state
@@ -1293,6 +1305,7 @@ mod tests {
             max_price:       (effective_ask * CONFIG.slippage_multiplier).min(0.99),
             spread:          Some(0.02),
             ev_breakdown:    "[Pen: 0.0 | ReqMom: 0.00]".into(),
+            neg_risk:        true,
         }
     }
 
@@ -1301,7 +1314,7 @@ mod tests {
     #[test]
     fn position_vwap_computed_on_construction() {
         let pos = Position::new(
-            "tok".into(), 0.60, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.60, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         assert!((pos.cost_basis - 0.60).abs() < f64::EPSILON);
         assert_eq!(pos.total_shares, 100);
@@ -1311,7 +1324,7 @@ mod tests {
     #[test]
     fn position_add_fill_updates_vwap() {
         let mut pos = Position::new(
-            "tok".into(), 0.60, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.60, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         // Add 100 shares at 0.40 → new VWAP = (60 + 40) / 200 = 0.50
         pos.add_fill(0.40, 100);
@@ -1323,7 +1336,7 @@ mod tests {
     fn position_take_profit_price_respects_ceiling() {
         init();
         let pos = Position::new(
-            "tok".into(), 0.95, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.95, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         // cost_basis * (1 + tp_pct) = 0.95 * 1.15 = 1.0925 → capped at EXIT_CEILING (0.98)
         let tp = pos.take_profit_price();
@@ -1334,7 +1347,7 @@ mod tests {
     fn position_take_profit_price_normal_case() {
         init();
         let pos = Position::new(
-            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         // 0.50 * 1.15 = 0.575 < EXIT_CEILING (0.98)
         let tp = pos.take_profit_price();
@@ -1345,7 +1358,7 @@ mod tests {
     #[test]
     fn position_unrealised_pnl_correct() {
         let pos = Position::new(
-            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         // bid = 0.65 → pnl = (0.65 - 0.50) * 100 = 15.0
         let pnl = pos.unrealised_pnl(0.65);
@@ -1355,7 +1368,7 @@ mod tests {
     #[test]
     fn position_sell_cooldown_initial_true() {
         let pos = Position::new(
-            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(),
+            "tok".into(), 0.50, 100, Direction::Up, "slug".into(), "cond".into(), false,
         );
         // No sell has occurred yet → cooldown is elapsed (should proceed).
         assert!(pos.sell_cooldown_elapsed());

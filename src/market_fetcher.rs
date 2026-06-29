@@ -239,6 +239,10 @@ impl MarketFetcher {
             "✅ Deterministic market synced!"
         );
 
+        // BTC/ETH up-down markets (and most binary markets on Polygon) are
+        // neg-risk markets using the neg-risk exchange contract for signing.
+        let neg_risk = market_slug.contains("updown") || market_slug.contains("up-down");
+
         Ok(MarketInfo {
             token_id_up,
             token_id_down,
@@ -246,6 +250,7 @@ impl MarketFetcher {
             market_slug,
             condition_id,
             expiry_ts,
+            neg_risk,
         })
     }
 

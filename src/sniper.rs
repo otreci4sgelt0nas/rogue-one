@@ -470,6 +470,7 @@ mod tests {
             market_slug:   "test-market".into(),
             condition_id:  "0xCOND".into(),
             expiry_ts:     9_999_999_999,
+            neg_risk:      false,
         };
         state.publish_market(info);
 

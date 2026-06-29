@@ -162,6 +162,12 @@ impl LiveSigner {
     /// References:
     /// - https://docs.polymarket.com/#signing-orders
     /// - py_clob_client/clob_types.py → `OrderBuilder.build_signed_order`
+    /// Sign a Polymarket CLOB order using EIP-712 typed data.
+    ///
+    /// * `neg_risk` — pass `true` for neg-risk markets (BTC/ETH up-down, most
+    ///   binary markets on Polygon). Uses a different exchange verifying contract.
+    ///   Standard exchange: `0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E`
+    ///   Neg-risk exchange: `0xC5d563A36AE78145C45a50134d48A1215220f80a`
     pub fn sign_order(
         &self,
         token_id:    &str,
@@ -169,12 +175,12 @@ impl LiveSigner {
         size:        u64,   // integer shares
         side:        Side,
         salt:        u64,   // random nonce for order deduplication
+        neg_risk:    bool,  // true for neg-risk markets (BTC/ETH up-down etc.)
     ) -> Result<String, String> {
         // ── Step 1: Compute takerAmount / makerAmount ─────────────────────────
         // Polymarket uses integer amounts in USDC micro-units (6 decimals).
-        // For a BUY at price p for n shares:
-        //   makerAmount = floor(price * size * 1_000_000)  (USDC the maker spends)
-        //   takerAmount = size * 1_000_000                  (tokens the taker receives)
+        // BUY:  makerAmount = USDC spent,  takerAmount = shares received
+        // SELL: makerAmount = shares given, takerAmount = USDC received
         let usdc_scale = 1_000_000u128;
         let (maker_amount, taker_amount) = match side {
             Side::Buy => {
@@ -190,37 +196,27 @@ impl LiveSigner {
         };
 
         // ── Step 2: EIP-712 domain separator ─────────────────────────────────
-        // Domain: { name: "Polymarket CTF Exchange", version: "1", chainId: 137,
-        //           verifyingContract: <CTF_EXCHANGE_ADDR> }
-        // Pre-computed keccak256 of the type string (constant):
-        //   keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
+        // Polymarket's exchange contract domain uses ONLY chainId + verifyingContract.
+        // (No `name` or `version` — confirmed from py-clob-client source.)
+        //
+        //   keccak256("EIP712Domain(uint256 chainId,address verifyingContract)")
         let domain_type_hash: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+            h.update(b"EIP712Domain(uint256 chainId,address verifyingContract)");
             h.finalize().into()
         };
 
-        let name_hash: [u8; 32] = {
-            let mut h = Keccak256::new();
-            h.update(b"Polymarket CTF Exchange");
-            h.finalize().into()
+        // Standard vs neg-risk exchange address (Polygon mainnet).
+        let exchange_addr_hex = if neg_risk {
+            "0xC5d563A36AE78145C45a50134d48A1215220f80a"  // neg-risk exchange
+        } else {
+            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"  // standard exchange
         };
-
-        let version_hash: [u8; 32] = {
-            let mut h = Keccak256::new();
-            h.update(b"1");
-            h.finalize().into()
-        };
-
-        // CTF Exchange proxy (Polygon mainnet — verified from py_clob_client source)
-        let exchange_addr_hex = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982e";
         let exchange_addr_bytes = decode_address(exchange_addr_hex)?;
 
         let domain_separator: [u8; 32] = {
-            let mut enc = Vec::with_capacity(5 * 32);
+            let mut enc = Vec::with_capacity(3 * 32);
             enc.extend_from_slice(&domain_type_hash);
-            enc.extend_from_slice(&name_hash);
-            enc.extend_from_slice(&version_hash);
             enc.extend_from_slice(&pad_u256(POLYGON_CHAIN_ID as u128));
             enc.extend_from_slice(&pad_address(&exchange_addr_bytes));
             let mut h = Keccak256::new();
@@ -229,14 +225,19 @@ impl LiveSigner {
         };
 
         // ── Step 3: Order struct hash ─────────────────────────────────────────
-        // keccak256("Order(uint256 salt,address maker,address taker,address tokenId,
-        //            uint256 makerAmount,uint256 takerAmount,uint256 expiration,
-        //            uint256 nonce,uint256 feeRateBps,uint8 signatureType,uint8 side)")
+        // Correct type string (verified against py-clob-client / py-order-utils):
+        //   Order(uint256 salt, address maker, address signer, address taker,
+        //         uint256 tokenId, uint256 makerAmount, uint256 takerAmount,
+        //         uint256 expiration, uint256 nonce, uint256 feeRateBps,
+        //         uint8 side, uint8 signatureType)
         //
-        // Field order must match the contract's EIP-712 type definition exactly.
+        // Key differences from naive implementation:
+        //   • `signer` field present between maker and taker
+        //   • tokenId is uint256 (not address)
+        //   • side comes BEFORE signatureType
         let order_type_hash: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(b"Order(uint256 salt,address maker,address taker,address tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 signatureType,uint8 side)");
+            h.update(b"Order(uint256 salt,address maker,address signer,address taker,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint256 expiration,uint256 nonce,uint256 feeRateBps,uint8 side,uint8 signatureType)");
             h.finalize().into()
         };
 
@@ -246,19 +247,21 @@ impl LiveSigner {
         let side_u8          = side as u8;
 
         let struct_hash: [u8; 32] = {
-            let mut enc = Vec::with_capacity(12 * 32);
+            // 13 fields × 32 bytes each
+            let mut enc = Vec::with_capacity(13 * 32);
             enc.extend_from_slice(&order_type_hash);
-            enc.extend_from_slice(&pad_u256(salt as u128));
-            enc.extend_from_slice(&pad_address(&maker_addr_bytes));
-            enc.extend_from_slice(&pad_address(&zero_addr));    // taker = zero
-            enc.extend_from_slice(&token_id_u256);
-            enc.extend_from_slice(&pad_u256(maker_amount));
-            enc.extend_from_slice(&pad_u256(taker_amount));
-            enc.extend_from_slice(&pad_u256(0));                // expiration = 0 (FAK)
-            enc.extend_from_slice(&pad_u256(0));                // nonce = 0
-            enc.extend_from_slice(&pad_u256(0));                // feeRateBps = 0
-            enc.extend_from_slice(&pad_u256(0));                // signatureType = 0 (EOA)
-            enc.extend_from_slice(&pad_u256(side_u8 as u128));
+            enc.extend_from_slice(&pad_u256(salt as u128));       // salt
+            enc.extend_from_slice(&pad_address(&maker_addr_bytes)); // maker
+            enc.extend_from_slice(&pad_address(&maker_addr_bytes)); // signer = maker (EOA)
+            enc.extend_from_slice(&pad_address(&zero_addr));       // taker = zero address
+            enc.extend_from_slice(&token_id_u256);                 // tokenId (uint256)
+            enc.extend_from_slice(&pad_u256(maker_amount));        // makerAmount
+            enc.extend_from_slice(&pad_u256(taker_amount));        // takerAmount
+            enc.extend_from_slice(&pad_u256(0));                   // expiration = 0 (FAK)
+            enc.extend_from_slice(&pad_u256(0));                   // nonce = 0
+            enc.extend_from_slice(&pad_u256(0));                   // feeRateBps = 0
+            enc.extend_from_slice(&pad_u256(side_u8 as u128));    // side  ← before signatureType
+            enc.extend_from_slice(&pad_u256(0));                   // signatureType = 0 (EOA)
             let mut h = Keccak256::new();
             h.update(&enc);
             h.finalize().into()
@@ -279,14 +282,13 @@ impl LiveSigner {
             .sign_prehash_recoverable(&digest)
             .map_err(|e| format!("ECDSA signing failed: {e}"))?;
 
-        // ── Step 6: Encode as [r(32) | s(32) | v(1)] base64 ──────────────────
-        // Ethereum recovery ID: v = 27 + recid (or 28).
+        // ── Step 6: Encode as 0x-prefixed hex [r(32)|s(32)|v(1)] ─────────────
+        // Ethereum recovery ID: v = 27 + recid.
         let mut raw_sig = [0u8; 65];
         raw_sig[..32].copy_from_slice(&sig.r().to_bytes());
         raw_sig[32..64].copy_from_slice(&sig.s().to_bytes());
         raw_sig[64] = 27 + recid.to_byte();
 
-        // Polymarket CLOB expects the signature as a 0x-prefixed hex string (130 hex chars).
         Ok(format!("0x{}", hex::encode(raw_sig)))
     }
 
@@ -371,8 +373,8 @@ pub struct OrderInner {
     pub nonce:          String,
     /// Protocol fee in basis points; "0" for takers.
     pub fee_rate_bps:   String,
-    /// "BUY" or "SELL".
-    pub side:           String,
+    /// 0 = BUY, 1 = SELL (integer, not string).
+    pub side:           u8,
     /// 0 = EOA (direct private-key signature).
     pub signature_type: u8,
     /// Base-64 encoded 65-byte [r|s|v] EIP-712 signature.
@@ -430,9 +432,10 @@ pub async fn execute_live_buy(
     buy_price:   f64,
     buy_size:    u64,
     order_value: f64,
+    neg_risk:    bool,
 ) -> Result<(f64, u64, Option<String>), String> {
     let salt = random_salt();
-    let sig  = signer.sign_order(token_id, buy_price, buy_size, Side::Buy, salt)?;
+    let sig  = signer.sign_order(token_id, buy_price, buy_size, Side::Buy, salt, neg_risk)?;
 
     // Compute amounts (mirrors the signing logic for the JSON body).
     let usdc_scale   = 1_000_000u128;
@@ -451,7 +454,7 @@ pub async fn execute_live_buy(
             expiration:     "0".to_string(),
             nonce:          "0".to_string(),
             fee_rate_bps:   "0".to_string(),
-            side:           "BUY".to_string(),
+            side:           Side::Buy as u8,   // 0 = BUY
             signature_type: 0,
             signature:      sig,
         },
@@ -534,9 +537,10 @@ pub async fn execute_live_sell(
     token_id:   &str,
     sell_price: f64,
     shares:     u64,
+    neg_risk:   bool,
 ) -> Result<(f64, Option<String>), String> {
     let salt = random_salt();
-    let sig  = signer.sign_order(token_id, sell_price, shares, Side::Sell, salt)?;
+    let sig  = signer.sign_order(token_id, sell_price, shares, Side::Sell, salt, neg_risk)?;
 
     let usdc_scale   = 1_000_000u128;
     let maker_amount = shares as u128 * usdc_scale;
@@ -554,7 +558,7 @@ pub async fn execute_live_sell(
             expiration:     "0".to_string(),
             nonce:          "0".to_string(),
             fee_rate_bps:   "0".to_string(),
-            side:           "SELL".to_string(),
+            side:           Side::Sell as u8,  // 1 = SELL
             signature_type: 0,
             signature:      sig,
         },
@@ -1285,32 +1289,34 @@ mod tests {
     }
 
     #[test]
-    fn sign_order_produces_base64() {
+    fn sign_order_produces_hex() {
         let signer = LiveSigner::from_hex_key(TEST_KEY).unwrap();
         let sig = signer
-            .sign_order("123456789", 0.65, 100, Side::Buy, 42)
+            .sign_order("123456789", 0.65, 100, Side::Buy, 42, false)
             .unwrap();
-        // Base64-encoded 65 bytes = ceil(65/3)*4 = 88 chars.
-        assert_eq!(sig.len(), 88);
-        assert!(B64.decode(&sig).is_ok());
+        // 0x + 65 bytes hex = 2 + 130 = 132 chars.
+        assert_eq!(sig.len(), 132);
+        assert!(sig.starts_with("0x"));
     }
 
     #[test]
     fn sign_l2_auth_produces_hex() {
         let signer = LiveSigner::from_hex_key(TEST_KEY).unwrap();
         let sig    = signer.sign_l2_auth(1_700_000_000, "POST", "/order").unwrap();
-        // 65 bytes = 130 hex chars.
-        assert_eq!(sig.len(), 130);
-        assert!(hex::decode(&sig).is_ok());
+        // 0x + 65 bytes hex = 132 chars.
+        assert_eq!(sig.len(), 132);
+        assert!(sig.starts_with("0x"));
+        assert!(hex::decode(&sig[2..]).is_ok());
     }
 
     #[test]
     fn pad_u256_encodes_correctly() {
+        // 1_000_000 = 0x000F4240 → bytes 28..32 = [0x00, 0x0F, 0x42, 0x40]
         let padded = pad_u256(1_000_000);
-        assert_eq!(padded[28], 0x0F);
-        assert_eq!(padded[29], 0x42);
-        assert_eq!(padded[30], 0x40);
-        assert_eq!(padded[31], 0x00);
+        assert_eq!(padded[28], 0x00);
+        assert_eq!(padded[29], 0x0F);
+        assert_eq!(padded[30], 0x42);
+        assert_eq!(padded[31], 0x40);
     }
 
     #[test]

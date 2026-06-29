@@ -149,6 +149,11 @@ pub struct MarketInfo {
     /// Also stored as `SharedState::market_expiry` (AtomicU64) for the
     /// hot-path check without going through the ArcSwap pointer chain.
     pub expiry_ts: u64,
+
+    /// True if this is a neg-risk market (uses the neg-risk exchange contract
+    /// `0xC5d563A36AE78145C45a50134d48A1215220f80a` for EIP-712 signing).
+    /// BTC/ETH up-down markets are always neg-risk on Polygon mainnet.
+    pub neg_risk: bool,
 }
 
 impl MarketInfo {
@@ -652,6 +657,10 @@ pub struct TriggerSnapshot {
     /// The pre-computed EV breakdown string from the last SituationRoom update.
     /// Cloned once here to avoid holding a reference across an await point.
     pub ev_breakdown: String,
+
+    /// Whether this market is a neg-risk market (uses the neg-risk exchange contract).
+    /// BTC/ETH up-down and most binary markets on Polygon are neg-risk.
+    pub neg_risk: bool,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1330,6 +1339,7 @@ mod tests {
             market_slug:   "btc-updown-15m-1749999600".into(),
             condition_id:  "0xABC".into(),
             expiry_ts:     1_750_000_500,
+            neg_risk:      true,
         };
         state.publish_market(info);
         assert_eq!(state.market_expiry.load(Ordering::Acquire), 1_750_000_500);
