@@ -345,34 +345,59 @@ pub enum Side {
 // CLOB HTTP request / response types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// JSON body sent to `POST /order`.
+/// Inner order object nested under the top-level `order` key.
+/// All amount fields are strings as required by the Polymarket CLOB API.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OrderRequest {
-    pub token_id:   String,
-    pub price:      f64,
-    pub size:       u64,
-    pub side:       &'static str,   // "BUY" or "SELL"
-    pub order_type: &'static str,   // "FAK"
-    pub signature:  String,
-    pub signer:     String,
-    pub salt:       u64,
-    pub maker_amount: u128,
-    pub taker_amount: u128,
-    pub expiration:   u64,          // 0 = no expiry (FAK)
-    pub nonce:        u64,
-    pub fee_rate_bps: u64,
+pub struct OrderInner {
+    /// Random nonce for deduplication (decimal string).
+    pub salt:           String,
+    /// Maker = wallet address (EIP-55 checksum).
+    pub maker:          String,
+    /// Signer = same as maker for EOA wallets.
+    pub signer:         String,
+    /// Taker = zero address (open order).
+    pub taker:          String,
+    /// Conditional token ID (decimal string).
+    pub token_id:       String,
+    /// USDC micro-units the maker sends (decimal string).
+    pub maker_amount:   String,
+    /// Token units the maker receives (decimal string).
+    pub taker_amount:   String,
+    /// Order expiration Unix timestamp; "0" = no expiry (FAK).
+    pub expiration:     String,
+    /// On-chain nonce; "0" for fresh orders.
+    pub nonce:          String,
+    /// Protocol fee in basis points; "0" for takers.
+    pub fee_rate_bps:   String,
+    /// "BUY" or "SELL".
+    pub side:           String,
+    /// 0 = EOA (direct private-key signature).
     pub signature_type: u8,
+    /// Base-64 encoded 65-byte [r|s|v] EIP-712 signature.
+    pub signature:      String,
+}
+
+/// Top-level payload for `POST /order`.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClobOrderPayload {
+    /// The signed order struct.
+    pub order:      OrderInner,
+    /// Owner = wallet address (same as maker).
+    pub owner:      String,
+    /// Order type: "FAK" (fill-and-kill), "FOK", "GTC".
+    pub order_type: String,
 }
 
 /// JSON response from `POST /order`.
+/// Polymarket returns `orderID` (uppercase ID) so we capture it via alias.
 #[derive(Debug, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct OrderResponse {
     pub success:   bool,
+    #[serde(rename = "orderID", alias = "orderId", default)]
     pub order_id:  Option<String>,
-    pub size:      Option<f64>,
-    pub price:     Option<f64>,
+    #[serde(rename = "errorMsg", alias = "error_msg", default)]
     pub error_msg: Option<String>,
 }
 
@@ -413,21 +438,24 @@ pub async fn execute_live_buy(
     let maker_amount = ((buy_price * buy_size as f64) * usdc_scale as f64) as u128;
     let taker_amount = buy_size as u128 * usdc_scale;
 
-    let body = OrderRequest {
-        token_id:       token_id.to_string(),
-        price:          buy_price,
-        size:           buy_size,
-        side:           "BUY",
-        order_type:     "FAK",
-        signature:      sig,
-        signer:         signer.wallet_address.clone(),
-        salt,
-        maker_amount,
-        taker_amount,
-        expiration:     0,
-        nonce:          0,
-        fee_rate_bps:   0,
-        signature_type: 0,
+    let body = ClobOrderPayload {
+        order: OrderInner {
+            salt:           salt.to_string(),
+            maker:          signer.wallet_address.clone(),
+            signer:         signer.wallet_address.clone(),
+            taker:          "0x0000000000000000000000000000000000000000".to_string(),
+            token_id:       token_id.to_string(),
+            maker_amount:   maker_amount.to_string(),
+            taker_amount:   taker_amount.to_string(),
+            expiration:     "0".to_string(),
+            nonce:          "0".to_string(),
+            fee_rate_bps:   "0".to_string(),
+            side:           "BUY".to_string(),
+            signature_type: 0,
+            signature:      sig,
+        },
+        owner:      signer.wallet_address.clone(),
+        order_type: "FAK".to_string(),
     };
 
     let now_ts = unix_ts_secs();
@@ -461,8 +489,10 @@ pub async fn execute_live_buy(
         return Err(format!("CLOB rejected BUY: {msg}"));
     }
 
-    let fill_price = parsed.price.unwrap_or(buy_price);
-    let fill_size  = parsed.size.map(|s| s as u64).unwrap_or(buy_size);
+    // Polymarket's /order response doesn't echo back price/size on success;
+    // use the values we submitted as the confirmed fill.
+    let fill_price = buy_price;
+    let fill_size  = buy_size;
 
     info!(
         token     = %&token_id[token_id.len().saturating_sub(6)..],
@@ -511,21 +541,24 @@ pub async fn execute_live_sell(
     let maker_amount = shares as u128 * usdc_scale;
     let taker_amount = ((sell_price * shares as f64) * usdc_scale as f64) as u128;
 
-    let body = OrderRequest {
-        token_id:       token_id.to_string(),
-        price:          sell_price,
-        size:           shares,
-        side:           "SELL",
-        order_type:     "FAK",
-        signature:      sig,
-        signer:         signer.wallet_address.clone(),
-        salt,
-        maker_amount,
-        taker_amount,
-        expiration:     0,
-        nonce:          0,
-        fee_rate_bps:   0,
-        signature_type: 0,
+    let body = ClobOrderPayload {
+        order: OrderInner {
+            salt:           salt.to_string(),
+            maker:          signer.wallet_address.clone(),
+            signer:         signer.wallet_address.clone(),
+            taker:          "0x0000000000000000000000000000000000000000".to_string(),
+            token_id:       token_id.to_string(),
+            maker_amount:   maker_amount.to_string(),
+            taker_amount:   taker_amount.to_string(),
+            expiration:     "0".to_string(),
+            nonce:          "0".to_string(),
+            fee_rate_bps:   "0".to_string(),
+            side:           "SELL".to_string(),
+            signature_type: 0,
+            signature:      sig,
+        },
+        owner:      signer.wallet_address.clone(),
+        order_type: "FAK".to_string(),
     };
 
     let now_ts = unix_ts_secs();
@@ -559,7 +592,7 @@ pub async fn execute_live_sell(
         return Err(format!("CLOB rejected SELL: {msg}"));
     }
 
-    let fill_price = parsed.price.unwrap_or(sell_price);
+    let fill_price = sell_price;
     let proceeds   = fill_price * shares as f64;
 
     info!(
@@ -889,12 +922,24 @@ fn pad_u256(val: u128) -> [u8; 32] {
 
 /// Convert a Polymarket token ID (decimal string) to a 32-byte ABI uint256.
 fn token_id_to_u256(token_id: &str) -> Result<[u8; 32], String> {
-    // Token IDs are decimal integers that fit in a u128 in practice.
-    // If they exceed 128 bits we handle the upper word separately.
-    let val: u128 = token_id
-        .parse()
-        .map_err(|_| format!("Token ID `{token_id}` is not a valid u128"))?;
-    Ok(pad_u256(val))
+    // Polymarket token IDs are arbitrary uint256 values in decimal.
+    // Parse digit-by-digit into a 32-byte big-endian buffer.
+    let mut result = [0u8; 32];
+    for ch in token_id.chars() {
+        let digit = ch.to_digit(10)
+            .ok_or_else(|| format!("Token ID `{token_id}` is not a valid uint256"))?;
+        // Multiply result by 10 and add digit (big-endian, byte-by-byte).
+        let mut carry = digit as u32;
+        for byte in result.iter_mut().rev() {
+            let val = (*byte as u32) * 10 + carry;
+            *byte = val as u8;
+            carry = val >> 8;
+        }
+        if carry != 0 {
+            return Err(format!("Token ID `{token_id}` overflows uint256"));
+        }
+    }
+    Ok(result)
 }
 
 /// Decode a 0x-prefixed hex result from `eth_call` into a u128 (the low 16 bytes).
