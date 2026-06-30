@@ -310,34 +310,90 @@ impl LiveSigner {
     // L2 API authentication header signature
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// Sign the L2 API authentication timestamp string.
+    /// Sign the Polymarket CLOB L1 API authentication header.
     ///
-    /// Polymarket's L2 auth scheme:
-    ///   message = "{timestamp}\x00{nonce}\x00{method}\x00{path}"
-    ///   signed  = personal_sign(keccak256(message), private_key)
+    /// Uses EIP-712 over the `ClobAuth` struct — matches `sign_clob_auth_message`
+    /// in `py_clob_client_v2/signing/eip712.py`.
     ///
-    /// The resulting hex signature is sent in the `POLY_SIGNATURE` header.
-    pub fn sign_l2_auth(
-        &self,
-        timestamp: u64,
-        method:    &str,   // e.g. "POST"
-        path:      &str,   // e.g. "/order"
-    ) -> Result<String, String> {
-        let nonce = 0u64;
-        let msg   = format!("{timestamp}\x00{nonce}\x00{method}\x00{path}");
+    /// Domain:  `ClobAuthDomain` / version `1` / chainId `137` (no verifyingContract)
+    /// Struct:  `ClobAuth(address address, string timestamp, uint256 nonce, string message)`
+    /// Message: `"This message attests that I control the given wallet"`
+    pub fn sign_clob_auth(&self, timestamp: u64) -> Result<String, String> {
+        // ── Domain separator (no verifyingContract) ───────────────────────────
+        let domain_type_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"EIP712Domain(string name,string version,uint256 chainId)");
+            h.finalize().into()
+        };
+        let name_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"ClobAuthDomain");
+            h.finalize().into()
+        };
+        let version_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"1");
+            h.finalize().into()
+        };
+        let domain_separator: [u8; 32] = {
+            let mut enc = Vec::with_capacity(4 * 32);
+            enc.extend_from_slice(&domain_type_hash);
+            enc.extend_from_slice(&name_hash);
+            enc.extend_from_slice(&version_hash);
+            enc.extend_from_slice(&pad_u256(POLYGON_CHAIN_ID as u128));
+            let mut h = Keccak256::new();
+            h.update(&enc);
+            h.finalize().into()
+        };
 
-        // Ethereum personal_sign prefix.
-        let prefixed = format!("\x19Ethereum Signed Message:\n{}{}", msg.len(), msg);
+        // ── ClobAuth struct hash ──────────────────────────────────────────────
+        // Type: ClobAuth(address address,string timestamp,uint256 nonce,string message)
+        let struct_type_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"ClobAuth(address address,string timestamp,uint256 nonce,string message)");
+            h.finalize().into()
+        };
+
+        let addr_bytes = decode_address(&self.wallet_address)?;
+
+        // EIP-712: dynamic types (string) are hashed
+        let ts_str = timestamp.to_string();
+        let ts_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(ts_str.as_bytes());
+            h.finalize().into()
+        };
+        let msg_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"This message attests that I control the given wallet");
+            h.finalize().into()
+        };
+
+        let struct_hash: [u8; 32] = {
+            let mut enc = Vec::with_capacity(5 * 32);
+            enc.extend_from_slice(&struct_type_hash);
+            enc.extend_from_slice(&pad_address(&addr_bytes)); // address
+            enc.extend_from_slice(&ts_hash);                  // string timestamp (hashed)
+            enc.extend_from_slice(&pad_u256(0));              // nonce = 0
+            enc.extend_from_slice(&msg_hash);                 // string message (hashed)
+            let mut h = Keccak256::new();
+            h.update(&enc);
+            h.finalize().into()
+        };
+
+        // ── Final EIP-712 digest ──────────────────────────────────────────────
         let digest: [u8; 32] = {
             let mut h = Keccak256::new();
-            h.update(prefixed.as_bytes());
+            h.update(b"\x19\x01");
+            h.update(domain_separator);
+            h.update(struct_hash);
             h.finalize().into()
         };
 
         let (sig, recid): (K256Sig, RecoveryId) = self
             .signing_key
             .sign_prehash_recoverable(&digest)
-            .map_err(|e| format!("L2 auth signing failed: {e}"))?;
+            .map_err(|e| format!("CLOB auth signing failed: {e}"))?;
 
         let mut raw = [0u8; 65];
         raw[..32].copy_from_slice(&sig.r().to_bytes());
@@ -345,6 +401,12 @@ impl LiveSigner {
         raw[64] = 27 + recid.to_byte();
 
         Ok(format!("0x{}", hex::encode(raw)))
+    }
+
+    /// Kept for compatibility — delegates to `sign_clob_auth`.
+    #[inline]
+    pub fn sign_l2_auth(&self, timestamp: u64, _method: &str, _path: &str) -> Result<String, String> {
+        self.sign_clob_auth(timestamp)
     }
 }
 
@@ -486,17 +548,17 @@ pub async fn execute_live_buy(
     };
 
     let now_ts = unix_ts_secs();
-    let l2_sig = signer.sign_l2_auth(now_ts, "POST", "/order")?;
+    let auth_sig = signer.sign_clob_auth(now_ts)?;
 
     let resp = http
         .post(CLOB_ORDER_URL)
         .header("Content-Type", "application/json")
         .header("POLY_ADDRESS",   &signer.wallet_address)
-        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_SIGNATURE", auth_sig)
         .header("POLY_TIMESTAMP", now_ts.to_string())
         .header("POLY_NONCE",     "0")
         .json(&body)
-        .timeout(Duration::from_millis(800))  // Hard latency ceiling for live orders
+        .timeout(Duration::from_millis(800))
         .send()
         .await
         .map_err(|e| format!("HTTP send failed: {e}"))?;
@@ -594,13 +656,13 @@ pub async fn execute_live_sell(
     };
 
     let now_ts = unix_ts_secs();
-    let l2_sig = signer.sign_l2_auth(now_ts, "POST", "/order")?;
+    let auth_sig = signer.sign_clob_auth(now_ts)?;
 
     let resp = http
         .post(CLOB_ORDER_URL)
         .header("Content-Type", "application/json")
         .header("POLY_ADDRESS",   &signer.wallet_address)
-        .header("POLY_SIGNATURE", l2_sig)
+        .header("POLY_SIGNATURE", auth_sig)
         .header("POLY_TIMESTAMP", now_ts.to_string())
         .header("POLY_NONCE",     "0")
         .json(&body)
