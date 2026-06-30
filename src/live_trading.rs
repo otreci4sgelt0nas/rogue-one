@@ -651,10 +651,19 @@ pub async fn execute_live_sell(
 /// }
 /// ```
 pub async fn get_usdc_balance(
-    http:           &reqwest::Client,
+    _http:          &reqwest::Client,  // kept for API compat; RPC uses its own plain client
     rpc_url:        &str,
     wallet_address: &str,
 ) -> Result<f64, String> {
+    // Use a dedicated minimal client for JSON-RPC calls.
+    // The CLOB executor's HTTP client has gzip + HTTP/2 keepalive settings tuned
+    // for the Polymarket REST API; those settings can silently interfere with
+    // Alchemy's JSON-RPC responses (confirmed by integration test with plain client).
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build RPC client: {e}"))?;
+
     // Query all three stablecoin contracts that Polymarket may use as collateral:
     //   1. pUSD  — V2 primary collateral
     //   2. USDC.e — V1 legacy bridged USDC (most wallets still hold this)
@@ -675,7 +684,7 @@ pub async fn get_usdc_balance(
     let mut total = 0.0f64;
     let mut all_failed = true;
     for (contract, label) in contracts {
-        match eth_call(http, rpc_url, contract, &calldata).await {
+        match eth_call(&http, rpc_url, contract, &calldata).await {
             Ok(result) => {
                 all_failed = false;
                 match decode_u256_result(&result) {
@@ -726,11 +735,15 @@ pub async fn get_usdc_balance(
 /// }
 /// ```
 pub async fn get_ctf_balance(
-    http:           &reqwest::Client,
+    _http:          &reqwest::Client,  // kept for API compat; RPC uses its own plain client
     rpc_url:        &str,
     wallet_address: &str,
     token_id:       &str,
 ) -> Result<f64, String> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Failed to build RPC client: {e}"))?;
     let addr_bytes   = decode_address(wallet_address)?;
     let token_u256   = token_id_to_u256(token_id)?;
 
@@ -739,7 +752,7 @@ pub async fn get_ctf_balance(
     calldata.extend_from_slice(&pad_address(&addr_bytes));
     calldata.extend_from_slice(&token_u256);
 
-    let result = eth_call(http, rpc_url, CTF_CONTRACT, &calldata).await?;
+    let result = eth_call(&http, rpc_url, CTF_CONTRACT, &calldata).await?;
     let raw    = decode_u256_result(&result)?;
 
     // CTF tokens have 6 decimals (same as USDC.e on Polygon).
@@ -1403,6 +1416,63 @@ mod tests {
         // Can't guarantee nonzero but should differ (with overwhelming probability).
         // At minimum, ensure they're the same type and no panic.
         let _ = (s1, s2);
+    }
+
+    /// Live RPC integration test — requires real POLY_RPC_URL and wallet in env.
+    /// Run with: cargo test rpc_pusd_balance -- --nocapture --ignored
+    #[tokio::test]
+    #[ignore]
+    async fn rpc_pusd_balance_live() {
+        dotenvy::dotenv().ok();
+        let rpc_url = std::env::var("POLY_RPC_URL")
+            .expect("POLY_RPC_URL must be set");
+        let wallet = std::env::var("WALLET_ADDRESS")
+            .or_else(|_| std::env::var("PRIVATE_KEY").map(|k| {
+                let signer = LiveSigner::from_hex_key(&k).expect("invalid key");
+                signer.wallet_address
+            }))
+            .expect("WALLET_ADDRESS or PRIVATE_KEY must be set");
+
+        println!("\n=== RPC balance test ===");
+        println!("RPC URL : {rpc_url}");
+        println!("Wallet  : {wallet}");
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build().unwrap();
+
+        // Test decode_u256_result with the known Alchemy response.
+        let known_response = "0x0000000000000000000000000000000000000000000000000000000000385043";
+        let decoded = decode_u256_result(known_response);
+        println!("decode_u256_result({known_response}) = {decoded:?}");
+        assert_eq!(decoded.unwrap(), 3690563, "decode_u256_result regression");
+
+        // Build calldata the same way get_usdc_balance does.
+        let addr_bytes = decode_address(&wallet).expect("invalid wallet");
+        let mut calldata = Vec::with_capacity(36);
+        calldata.extend_from_slice(&BALANCE_OF_SELECTOR);
+        calldata.extend_from_slice(&pad_address(&addr_bytes));
+        println!("calldata : 0x{}", hex::encode(&calldata));
+
+        // Direct eth_call for pUSD.
+        println!("Querying pUSD ({USDC_CONTRACT})...");
+        match eth_call(&http, &rpc_url, USDC_CONTRACT, &calldata).await {
+            Ok(raw_hex) => {
+                println!("  raw_hex  : {raw_hex}");
+                match decode_u256_result(&raw_hex) {
+                    Ok(raw) => println!("  balance  : ${:.6} (raw={raw})", raw as f64 / 1e6),
+                    Err(e)  => println!("  decode ERR: {e}"),
+                }
+            }
+            Err(e) => println!("  eth_call ERR: {e}"),
+        }
+
+        // Full helper.
+        println!("Calling get_usdc_balance helper...");
+        match get_usdc_balance(&http, &rpc_url, &wallet).await {
+            Ok(bal)  => println!("  TOTAL balance = ${bal:.6}"),
+            Err(e)   => println!("  get_usdc_balance ERR: {e}"),
+        }
     }
 
     #[test]
