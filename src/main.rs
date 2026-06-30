@@ -258,7 +258,27 @@ async fn main() {
     // order-book snapshot, and market timing to compute dynamic momentum
     // thresholds and EV scores, then publishes them atomically into SharedState
     // via an ArcSwap so the Binance hot path sees them without a lock.
-    SituationRoom::new().start(Arc::clone(&state));
+    
+    // ── Step 6c: Derive Polymarket L2 API credentials ───────────────────────────
+    // The /order endpoint requires L2 (HMAC-SHA256) auth, not L1.
+    // Credentials are deterministically derived from the private key via
+    // GET /auth/derive-api-key with L1 (EIP-712 ClobAuth) headers.
+    if !CONFIG.paper_mode {
+        if let Some(signer) = executor.signer.as_ref() {
+            info!("🔑 Deriving Polymarket L2 API credentials...");
+            match crate::live_trading::derive_api_credentials(signer).await {
+                Ok(creds) => {
+                    executor.set_api_credentials(creds);
+                    info!("✅ L2 API credentials stored.");
+                }
+                Err(e) => {
+                    error!(error = %e, "❌ Failed to derive L2 API credentials — live orders will be rejected.");
+                }
+            }
+        }
+    }
+
+SituationRoom::new().start(Arc::clone(&state));
     info!("SituationRoom heuristics loop spawned.");
 
     // ── Step 8: Spawn Polymarket WebSocket task ───────────────────────────────

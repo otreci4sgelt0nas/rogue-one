@@ -60,11 +60,15 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{Engine as _, engine::general_purpose::{STANDARD as B64, URL_SAFE as B64_URL}};
+use hmac::{Hmac, Mac};
 use k256::ecdsa::{RecoveryId, Signature as K256Sig, SigningKey, VerifyingKey};
 use k256::ecdsa::signature::hazmat::PrehashSigner as _;
+use sha2::Sha256;
 use sha3::{Digest, Keccak256};
 use tracing::{error, info, warn};
+
+type HmacSha256 = Hmac<Sha256>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -102,6 +106,109 @@ const BALANCE_OF_SELECTOR: [u8; 4] = [0x70, 0xa0, 0x82, 0x31];
 
 /// `balanceOf(address,uint256)` selector: keccak256("balanceOf(address,uint256)")[0..4]
 const ERC1155_BALANCE_OF_SELECTOR: [u8; 4] = [0x00, 0xfd, 0xd5, 0x8e];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ApiCredentials — L2 HMAC credentials derived from the private key
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Polymarket L2 API credentials derived via `GET /auth/derive-api-key`.
+///
+/// These are used for HMAC-SHA256 signing of order-submission requests.
+/// Credentials are deterministically derived from the private key and are
+/// stable across restarts — no need to store or rotate them.
+#[derive(Debug, Clone)]
+pub struct ApiCredentials {
+    pub api_key:        String,
+    /// Base64-URL-encoded HMAC secret.
+    pub api_secret:     String,
+    pub api_passphrase: String,
+}
+
+/// Fetch L2 API credentials from the CLOB using L1 (EIP-712 ClobAuth) auth.
+///
+/// Calls `GET https://clob.polymarket.com/auth/derive-api-key` with L1 headers.
+/// Returns stable, deterministic credentials that can be reused across restarts.
+pub async fn derive_api_credentials(signer: &LiveSigner) -> Result<ApiCredentials, String> {
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {e}"))?;
+
+    let now_ts = unix_ts_secs();
+    let auth_sig = signer.sign_clob_auth(now_ts)?;
+
+    let resp = http
+        .get("https://clob.polymarket.com/auth/derive-api-key")
+        .header("POLY_ADDRESS",   &signer.wallet_address)
+        .header("POLY_SIGNATURE", auth_sig)
+        .header("POLY_TIMESTAMP", now_ts.to_string())
+        .header("POLY_NONCE",     "0")
+        .send()
+        .await
+        .map_err(|e| format!("Credential derivation HTTP failed: {e}"))?;
+
+    let status = resp.status();
+    let text = resp.text().await
+        .map_err(|e| format!("Credential response read failed: {e}"))?;
+
+    if !status.is_success() {
+        return Err(format!("Credential derivation HTTP {status}: {text}"));
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CredResp {
+        #[serde(rename = "apiKey")]
+        api_key:    String,
+        secret:     String,
+        passphrase: String,
+    }
+
+    let c: CredResp = serde_json::from_str(&text)
+        .map_err(|e| format!("Credential parse error: {e} — body: {text}"))?;
+
+    info!(
+        api_key = %c.api_key,
+        "✅ Polymarket L2 API credentials derived."
+    );
+
+    Ok(ApiCredentials {
+        api_key:        c.api_key,
+        api_secret:     c.secret,
+        api_passphrase: c.passphrase,
+    })
+}
+
+/// Build L2 HMAC-SHA256 auth headers for a CLOB request.
+///
+/// Matches `build_hmac_signature` + `create_level_2_headers` in py_clob_client_v2.
+/// The HMAC message = `"{timestamp}{method}{path}{body}"`.
+/// The resulting signature is URL-safe base64 (NOT hex).
+pub fn build_l2_headers(
+    wallet_address: &str,
+    creds: &ApiCredentials,
+    timestamp: u64,
+    method:    &str,
+    path:      &str,
+    body:      &str,
+) -> Result<Vec<(&'static str, String)>, String> {
+    let key_bytes = B64_URL.decode(&creds.api_secret)
+        .map_err(|e| format!("Base64 decode of api_secret failed: {e}"))?;
+
+    let message = format!("{timestamp}{method}{path}{body}");
+
+    let mut mac = HmacSha256::new_from_slice(&key_bytes)
+        .map_err(|e| format!("HMAC key error: {e}"))?;
+    mac.update(message.as_bytes());
+    let sig = B64_URL.encode(mac.finalize().into_bytes());
+
+    Ok(vec![
+        ("POLY_ADDRESS",    wallet_address.to_string()),
+        ("POLY_SIGNATURE",  sig),
+        ("POLY_TIMESTAMP",  timestamp.to_string()),
+        ("POLY_API_KEY",    creds.api_key.clone()),
+        ("POLY_PASSPHRASE", creds.api_passphrase.clone()),
+    ])
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // LiveSigner — holds the pre-parsed signing key for zero-cost per-order signing
@@ -507,6 +614,7 @@ pub struct OrderResponse {
 pub async fn execute_live_buy(
     http:        &reqwest::Client,
     signer:      &LiveSigner,
+    creds:       &ApiCredentials,
     token_id:    &str,
     buy_price:   f64,
     buy_size:    u64,
@@ -547,22 +655,23 @@ pub async fn execute_live_buy(
         post_only:  false,
     };
 
-    let now_ts = unix_ts_secs();
-    let auth_sig = signer.sign_clob_auth(now_ts)?;
+    // Serialize the body to compact JSON — used for both the HTTP body and HMAC.
+    let body_json = serde_json::to_string(&body)
+        .map_err(|e| format!("BUY body serialization failed: {e}"))?;
 
-    let resp = http
+    let now_ts = unix_ts_secs();
+    let l2_headers = build_l2_headers(
+        &signer.wallet_address, creds, now_ts, "POST", "/order", &body_json,
+    )?;
+
+    let mut req = http
         .post(CLOB_ORDER_URL)
         .header("Content-Type", "application/json")
-        .header("POLY_ADDRESS",   &signer.wallet_address)
-        .header("POLY_SIGNATURE", auth_sig)
-        .header("POLY_TIMESTAMP", now_ts.to_string())
-        .header("POLY_NONCE",     "0")
-        .json(&body)
         .timeout(Duration::from_millis(800))
-        .send()
-        .await
-        .map_err(|e| format!("HTTP send failed: {e}"))?;
+        .body(body_json);
+    for (k, v) in &l2_headers { req = req.header(*k, v); }
 
+    let resp   = req.send().await.map_err(|e| format!("HTTP send failed: {e}"))?;
     let status = resp.status();
     let text   = resp.text().await.map_err(|e| format!("HTTP body read failed: {e}"))?;
 
@@ -582,11 +691,11 @@ pub async fn execute_live_buy(
     let fill_size  = parsed.size.map(|s| s as u64).unwrap_or(buy_size);
 
     info!(
-        token     = %&token_id[token_id.len().saturating_sub(6)..],
-        fill_price = fill_price,
-        fill_size  = fill_size,
+        token       = %&token_id[token_id.len().saturating_sub(6)..],
+        fill_price  = fill_price,
+        fill_size   = fill_size,
         order_value = order_value,
-        order_id  = ?parsed.order_id,
+        order_id    = ?parsed.order_id,
         "🟢 LIVE BUY FILLED."
     );
 
@@ -617,6 +726,7 @@ pub async fn execute_live_buy(
 pub async fn execute_live_sell(
     http:       &reqwest::Client,
     signer:     &LiveSigner,
+    creds:      &ApiCredentials,
     token_id:   &str,
     sell_price: f64,
     shares:     u64,
@@ -655,22 +765,22 @@ pub async fn execute_live_sell(
         post_only:  false,
     };
 
-    let now_ts = unix_ts_secs();
-    let auth_sig = signer.sign_clob_auth(now_ts)?;
+    let body_json = serde_json::to_string(&body)
+        .map_err(|e| format!("SELL body serialization failed: {e}"))?;
 
-    let resp = http
+    let now_ts = unix_ts_secs();
+    let l2_headers = build_l2_headers(
+        &signer.wallet_address, creds, now_ts, "POST", "/order", &body_json,
+    )?;
+
+    let mut req = http
         .post(CLOB_ORDER_URL)
         .header("Content-Type", "application/json")
-        .header("POLY_ADDRESS",   &signer.wallet_address)
-        .header("POLY_SIGNATURE", auth_sig)
-        .header("POLY_TIMESTAMP", now_ts.to_string())
-        .header("POLY_NONCE",     "0")
-        .json(&body)
         .timeout(Duration::from_millis(800))
-        .send()
-        .await
-        .map_err(|e| format!("HTTP send failed: {e}"))?;
+        .body(body_json);
+    for (k, v) in &l2_headers { req = req.header(*k, v); }
 
+    let resp   = req.send().await.map_err(|e| format!("HTTP send failed: {e}"))?;
     let status = resp.status();
     let text   = resp.text().await.map_err(|e| format!("HTTP body read failed: {e}"))?;
 

@@ -333,6 +333,11 @@ pub struct ClobExecutor {
     /// Live trading signer — owns the parsed secp256k1 key and wallet address.
     /// `None` in paper mode or when PRIVATE_KEY is absent/invalid.
     pub signer: Option<Arc<LiveSigner>>,
+
+    /// Polymarket L2 API credentials (api_key, api_secret, api_passphrase).
+    /// Derived at startup from the private key via `/auth/derive-api-key`.
+    /// `None` until `set_api_credentials` is called from main.
+    pub api_creds: Mutex<Option<crate::live_trading::ApiCredentials>>,
 }
 
 impl ClobExecutor {
@@ -406,8 +411,14 @@ impl ClobExecutor {
             wallet_address,
             csv_filename,
             last_summary_expiry: Mutex::new(None),
-            signer: signer_result,
+            signer:    signer_result,
+            api_creds: Mutex::new(None),
         })
+    }
+
+    /// Store L2 API credentials derived at startup.
+    pub fn set_api_credentials(&self, creds: crate::live_trading::ApiCredentials) {
+        *self.api_creds.lock() = Some(creds);
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -651,6 +662,8 @@ impl ClobExecutor {
         spread_str:  &str,
     ) -> ExecResult<TradeOutcome> {
         let signer = self.signer.as_ref().ok_or(ExecutorError::NotAuthenticated)?;
+        let creds  = self.api_creds.lock();
+        let creds  = creds.as_ref().ok_or(ExecutorError::NotAuthenticated)?;
         let order_value = buy_price * buy_size as f64;
 
         warn!(
@@ -667,6 +680,7 @@ impl ClobExecutor {
             crate::live_trading::execute_live_buy(
                 &self.http,
                 signer,
+                creds,
                 &snap.token_id,
                 buy_price,
                 buy_size,
@@ -1088,7 +1102,7 @@ impl ClobExecutor {
                 pnl,
             );
         } else {
-            // ── Live sell ─────────────────────────────────────────────────────
+            // ── Live sell ──────────────────────────────────────────────────
             let signer = match self.signer.as_ref() {
                 Some(s) => s,
                 None => {
@@ -1100,10 +1114,19 @@ impl ClobExecutor {
                     return;
                 }
             };
+            let creds_guard = self.api_creds.lock();
+            let creds = match creds_guard.as_ref() {
+                Some(c) => c,
+                None => {
+                    warn!(token = %&token_id[token_id.len().saturating_sub(6)..], "Live sell skipped — no API credentials.");
+                    return;
+                }
+            };
 
             match crate::live_trading::execute_live_sell(
                 &self.http,
                 signer,
+                creds,
                 token_id,
                 sell_price,
                 shares,
