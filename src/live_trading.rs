@@ -363,19 +363,21 @@ pub enum Side {
 // CLOB HTTP request / response types
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Inner order object nested inside `ClobOrderPayload`.
+/// The `order` object nested inside `ClobOrderPayload` (V2 API spec).
 ///
-/// V2: `taker`, `nonce`, and `feeRateBps` fields have been removed.
+/// V2 changes vs V1:
+///   - `taker`, `nonce`, `feeRateBps` removed from this struct
+///   - `signature` and `side` moved UP to the top-level `ClobOrderPayload`
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrderInner {
-    /// Random salt for order deduplication.
-    pub salt:           u64,
+    /// Random salt for order deduplication (decimal string).
+    pub salt:           String,
     /// Maker = wallet address (EIP-55 checksum).
     pub maker:          String,
     /// Signer = same as maker for EOA wallets.
     pub signer:         String,
-    // ❌ V1 had: taker (zero address) — removed in V2
+    // ❌ V1 had: taker — removed in V2
     /// Conditional token ID (decimal string).
     pub token_id:       String,
     /// USDC micro-units the maker sends (decimal string).
@@ -384,24 +386,26 @@ pub struct OrderInner {
     pub taker_amount:   String,
     /// Order expiration Unix timestamp; "0" = no expiry (FAK).
     pub expiration:     String,
-    // ❌ V1 had: nonce      — removed in V2
-    // ❌ V1 had: feeRateBps — removed in V2
-    /// "BUY" or "SELL".
-    pub side:           String,
+    // ❌ V1 had: nonce, feeRateBps — removed in V2
+    // ❌ V1 had: side here — moved to top-level ClobOrderPayload in V2
     /// 0 = EOA (direct private-key signature).
     pub signature_type: u8,
-    /// 0x-prefixed hex ECDSA signature of the EIP-712 order digest.
-    pub signature:      String,
+    // ❌ V1 had: signature here — moved to top-level ClobOrderPayload in V2
 }
 
-/// Top-level JSON body sent to `POST /order`.
+/// Top-level JSON body sent to `POST /order` (V2 API spec).
+///
+/// V2 restructures the payload: `signature` and `side` are now at the
+/// top level instead of nested inside the `order` object.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ClobOrderPayload {
-    /// The signed order object.
+    /// The unsigned order fields.
     pub order:      OrderInner,
-    /// Owner = maker wallet address.
-    pub owner:      String,
+    /// 0x-prefixed hex ECDSA signature of the EIP-712 order digest.
+    pub signature:  String,
+    /// "BUY" or "SELL" — top-level in V2.
+    pub side:       String,
     /// Order type: "FAK" (Fill-and-Kill / marketable limit order).
     pub order_type: String,
 }
@@ -457,20 +461,17 @@ pub async fn execute_live_buy(
 
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt,
+            salt:           salt.to_string(),
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
-            // V2: taker field removed
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             expiration:     "0".to_string(),
-            // V2: nonce and fee_rate_bps fields removed
-            side:           "BUY".to_string(),
             signature_type: 0,
-            signature:      sig,
         },
-        owner:      signer.wallet_address.clone(),
+        signature:  sig,
+        side:       "BUY".to_string(),
         order_type: "FAK".to_string(),
     };
 
@@ -558,20 +559,17 @@ pub async fn execute_live_sell(
 
     let body = ClobOrderPayload {
         order: OrderInner {
-            salt,
+            salt:           salt.to_string(),
             maker:          signer.wallet_address.clone(),
             signer:         signer.wallet_address.clone(),
-            // V2: taker field removed
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             expiration:     "0".to_string(),
-            // V2: nonce and fee_rate_bps fields removed
-            side:           "SELL".to_string(),
             signature_type: 0,
-            signature:      sig,
         },
-        owner:      signer.wallet_address.clone(),
+        signature:  sig,
+        side:       "SELL".to_string(),
         order_type: "FAK".to_string(),
     };
 
