@@ -673,21 +673,35 @@ pub async fn get_usdc_balance(
     ];
 
     let mut total = 0.0f64;
+    let mut all_failed = true;
     for (contract, label) in contracts {
         match eth_call(http, rpc_url, contract, &calldata).await {
-            Ok(result) => match decode_u256_result(&result) {
-                Ok(raw) if raw > 0 => {
-                    let bal = raw as f64 / 1_000_000.0;
-                    tracing::debug!(contract = label, balance = bal, "💵 Stablecoin balance found.");
-                    total += bal;
+            Ok(result) => {
+                all_failed = false;
+                match decode_u256_result(&result) {
+                    Ok(raw) => {
+                        let bal = raw as f64 / 1_000_000.0;
+                        info!(contract = label, balance = bal, raw_hex = %result, "💵 Stablecoin balance checked.");
+                        total += bal;
+                    }
+                    Err(e) => {
+                        error!(contract = label, raw_hex = %result, error = %e, "Balance decode failed.");
+                    }
                 }
-                Ok(_) => {} // zero balance — skip
-                Err(e) => tracing::warn!(contract = label, error = %e, "Balance decode failed."),
-            },
-            Err(e) => tracing::warn!(contract = label, error = %e, "eth_call failed for stablecoin."),
+            }
+            Err(e) => {
+                error!(contract = label, error = %e, "eth_call failed for stablecoin contract.");
+            }
         }
     }
 
+    if all_failed {
+        return Err(format!(
+            "All stablecoin RPC calls failed — check POLY_RPC_URL. wallet={wallet_address}"
+        ));
+    }
+
+    info!(total_bankroll = total, wallet = %wallet_address, "💰 Total stablecoin bankroll resolved.");
     Ok(total)
 }
 
@@ -969,6 +983,11 @@ fn token_id_to_u256(token_id: &str) -> Result<[u8; 32], String> {
 /// Decode a 0x-prefixed hex result from `eth_call` into a u128 (the low 16 bytes).
 fn decode_u256_result(hex_result: &str) -> Result<u128, String> {
     let clean = hex_result.trim_start_matches("0x");
+    // Some RPCs return "0x" or "0x0" for a zero uint256 result.
+    // Normalise: left-pad with zeros to at least 32 hex chars (16 bytes).
+    if clean.is_empty() || (clean.len() < 32 && clean.chars().all(|c| c == '0')) {
+        return Ok(0);
+    }
     if clean.len() < 32 {
         return Err(format!("eth_call result too short: `{hex_result}`"));
     }
