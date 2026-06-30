@@ -114,6 +114,13 @@ k256  = { version = "0.13", features = ["ecdsa"] }
 sha3  = "0.10"
 hex   = "0.4"
 
+# HMAC-SHA256 for Polymarket L2 API auth
+hmac   = "0.12"
+sha2   = "0.10"
+digest = "0.10"
+# Base64 encoding for ECDSA signatures
+base64 = "0.22"
+
 # ── Reconnect / Back-Off for WS Reconnect Loop ────────────────────────────────
 tokio-retry = "0.3"
 

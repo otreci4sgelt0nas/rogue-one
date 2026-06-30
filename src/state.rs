@@ -149,6 +149,10 @@ pub struct MarketInfo {
     /// Also stored as `SharedState::market_expiry` (AtomicU64) for the
     /// hot-path check without going through the ArcSwap pointer chain.
     pub expiry_ts: u64,
+
+    /// Whether this is a NegRisk market (BTC/ETH Up-Down).
+    /// NegRisk markets must sign against the NegRisk CTF Exchange V2 contract.
+    pub neg_risk: bool,
 }
 
 impl MarketInfo {
@@ -1330,6 +1334,7 @@ mod tests {
             market_slug:   "btc-updown-15m-1749999600".into(),
             condition_id:  "0xABC".into(),
             expiry_ts:     1_750_000_500,
+            neg_risk:      false,
         };
         state.publish_market(info);
         assert_eq!(state.market_expiry.load(Ordering::Acquire), 1_750_000_500);

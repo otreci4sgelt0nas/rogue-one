@@ -58,6 +58,10 @@ struct GammaMarket {
 
     /// UMA condition ID used for on-chain redemption after settlement.
     condition_id: Option<String>,
+
+    /// Whether this is a NegRisk market.
+    #[serde(default)]
+    neg_risk: Option<bool>,
 }
 
 /// Custom Serde deserialiser: accepts both a native JSON string-array
@@ -222,6 +226,7 @@ impl MarketFetcher {
 
         let market_id = market.id.clone().unwrap_or_default();
         let condition_id = market.condition_id.clone().unwrap_or_default();
+        let neg_risk = market.neg_risk.unwrap_or(false);
 
         let (token_id_up, token_id_down) = self
             .extract_token_ids(market, &market_id)
@@ -246,6 +251,7 @@ impl MarketFetcher {
             market_slug,
             condition_id,
             expiry_ts,
+            neg_risk,
         })
     }
 
@@ -360,6 +366,7 @@ mod tests {
             clob_token_ids: Some(r#"["tok_up","tok_down"]"#.into()),
             outcomes: Some(vec!["Up".into(), "Down".into()]),
             condition_id: None,
+            neg_risk: None,
         };
         let (up, down) = fetcher.extract_token_ids(&market, "test_market").unwrap();
         assert_eq!(up,   "tok_up");
@@ -374,6 +381,7 @@ mod tests {
             clob_token_ids: Some(r#"["tok_yes","tok_no"]"#.into()),
             outcomes: Some(vec!["Yes".into(), "No".into()]),
             condition_id: None,
+            neg_risk: None,
         };
         let (up, down) = fetcher.extract_token_ids(&market, "test_market").unwrap();
         assert_eq!(up,   "tok_yes");
@@ -389,6 +397,7 @@ mod tests {
             clob_token_ids: Some(r#"["tok_0","tok_1"]"#.into()),
             outcomes: Some(vec!["Weird".into(), "Labels".into()]),
             condition_id: None,
+            neg_risk: None,
         };
         let (up, down) = fetcher.extract_token_ids(&market, "test_market").unwrap();
         assert_eq!(up,   "tok_0");
@@ -403,6 +412,7 @@ mod tests {
             clob_token_ids: Some("[]".into()),
             outcomes: Some(vec![]),
             condition_id: None,
+            neg_risk: None,
         };
         assert!(fetcher.extract_token_ids(&market, "test_market").is_err());
     }
@@ -415,6 +425,7 @@ mod tests {
             clob_token_ids: Some("not json".into()),
             outcomes: None,
             condition_id: None,
+            neg_risk: None,
         };
         assert!(fetcher.extract_token_ids(&market, "test_market").is_err());
     }
@@ -428,6 +439,7 @@ mod tests {
             clob_token_ids: Some(r#"["tok_down","tok_up"]"#.into()),
             outcomes: Some(vec!["Down".into(), "Up".into()]),
             condition_id: None,
+            neg_risk: None,
         };
         let (up, down) = fetcher.extract_token_ids(&market, "test_market").unwrap();
         // Up outcome is at index 1, Down at index 0
