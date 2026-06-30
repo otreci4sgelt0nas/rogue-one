@@ -683,34 +683,26 @@ pub async fn get_usdc_balance(
 
     let mut total = 0.0f64;
     let mut all_failed = true;
-    eprintln!("[BANKROLL_DEBUG] Starting balance fetch. wallet={wallet_address} rpc={rpc_url}");
     for (contract, label) in contracts {
-        eprintln!("[BANKROLL_DEBUG] Querying {label} at {contract}...");
         match eth_call(&http, rpc_url, contract, &calldata).await {
             Ok(result) => {
                 all_failed = false;
-                eprintln!("[BANKROLL_DEBUG] {label} raw_hex={result}");
                 match decode_u256_result(&result) {
                     Ok(raw) => {
                         let bal = raw as f64 / 1_000_000.0;
-                        eprintln!("[BANKROLL_DEBUG] {label} balance=${bal:.6}");
                         info!(contract = label, balance = bal, raw_hex = %result, "💵 Stablecoin balance checked.");
                         total += bal;
                     }
                     Err(e) => {
-                        eprintln!("[BANKROLL_DEBUG] {label} decode error: {e}");
                         error!(contract = label, raw_hex = %result, error = %e, "Balance decode failed.");
                     }
                 }
             }
             Err(e) => {
-                eprintln!("[BANKROLL_DEBUG] {label} eth_call error: {e}");
                 error!(contract = label, error = %e, "eth_call failed for stablecoin contract.");
             }
         }
     }
-
-    eprintln!("[BANKROLL_DEBUG] Loop done. all_failed={all_failed} total={total}");
     if all_failed {
         return Err(format!(
             "All stablecoin RPC calls failed — check POLY_RPC_URL. wallet={wallet_address}"
