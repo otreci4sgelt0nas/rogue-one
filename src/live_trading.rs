@@ -984,12 +984,29 @@ fn pad_u256(val: u128) -> [u8; 32] {
 
 /// Convert a Polymarket token ID (decimal string) to a 32-byte ABI uint256.
 fn token_id_to_u256(token_id: &str) -> Result<[u8; 32], String> {
-    // Token IDs are decimal integers that fit in a u128 in practice.
-    // If they exceed 128 bits we handle the upper word separately.
-    let val: u128 = token_id
-        .parse()
-        .map_err(|_| format!("Token ID `{token_id}` is not a valid u128"))?;
-    Ok(pad_u256(val))
+    // Polymarket token IDs are decimal representations of uint256 values.
+    // NegRisk/Up-Down market token IDs routinely exceed u128::MAX (~78 digits),
+    // so we cannot use u128::parse. Instead we do big-decimal → 32-byte BE
+    // arithmetic: start with [0u8;32] and repeatedly multiply by 10 + add digit.
+    if token_id.is_empty() {
+        return Err("Token ID is empty".to_string());
+    }
+    let mut result = [0u8; 32];
+    for ch in token_id.chars() {
+        let digit = ch.to_digit(10)
+            .ok_or_else(|| format!("Token ID `{token_id}` contains non-digit character '{ch}'"))?;
+        // result = result * 10 + digit  (big-endian, in place)
+        let mut carry = digit as u32;
+        for byte in result.iter_mut().rev() {
+            let val = (*byte as u32) * 10 + carry;
+            *byte  = (val & 0xff) as u8;
+            carry  = val >> 8;
+        }
+        if carry > 0 {
+            return Err(format!("Token ID `{token_id}` overflows 256 bits"));
+        }
+    }
+    Ok(result)
 }
 
 /// Decode a 0x-prefixed hex result from `eth_call` into a u128 (the low 16 bytes).
@@ -1385,11 +1402,16 @@ mod tests {
 
     #[test]
     fn token_id_to_u256_parses_large_decimal() {
-        // Real Polymarket token IDs are large decimal integers.
-        let id  = "52114319501245915516055106046884209969926127482827954674443846427813813222426";
-        // Should not panic; just needs to be parseable as u128 modulo (truncation for very large ids)
-        // If it exceeds u128, this test verifies we get an error, not a panic.
-        let _result = token_id_to_u256(id); // ok or err, either is fine — no panic
+        // Standard market token ID (fits in u128).
+        let small = "52114319501245915516055106046884209969926127482827954674443846427813813222426";
+        assert!(token_id_to_u256(small).is_ok());
+
+        // NegRisk/Up-Down token ID that exceeds u128::MAX — must now succeed.
+        let large = "84222033350467951889910809049201507042941616771733257462110487786271311278674";
+        let bytes = token_id_to_u256(large).expect("NegRisk token ID must parse as uint256");
+        assert_eq!(bytes.len(), 32);
+        // Leading bytes should be non-zero (it's a large number).
+        assert!(bytes[..16].iter().any(|&b| b != 0), "High bytes should be non-zero for large token ID");
     }
 
     #[test]
