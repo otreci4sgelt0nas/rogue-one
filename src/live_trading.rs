@@ -291,6 +291,8 @@ impl LiveSigner {
         salt:         u64,   // random nonce for order deduplication
         neg_risk:     bool,  // true for neg-risk markets (BTC/ETH up-down etc.)
         timestamp_ms: u64,   // current time in milliseconds
+        maker_addr:   &str,  // maker address (EOA or funder/proxy wallet)
+        sig_type:     u8,    // 0=EOA, 1=PolyProxy, 2=GnosisSafe
     ) -> Result<String, String> {
         // ── Step 1: Compute takerAmount / makerAmount ─────────────────────────
         // Polymarket uses integer amounts in USDC micro-units (6 decimals).
@@ -362,27 +364,29 @@ impl LiveSigner {
             h.finalize().into()
         };
 
-        let maker_addr_bytes = decode_address(&self.wallet_address)?;
-        let token_id_u256    = token_id_to_u256(token_id)?;
-        let side_u8          = side as u8;
-        let metadata         = [0u8; 32]; // BYTES32_ZERO
-        let builder          = [0u8; 32]; // BYTES32_ZERO
+        // maker = funder/proxy wallet; signer = EOA (self.wallet_address)
+        let maker_addr_bytes  = decode_address(maker_addr)?;
+        let signer_addr_bytes = decode_address(&self.wallet_address)?;
+        let token_id_u256     = token_id_to_u256(token_id)?;
+        let side_u8           = side as u8;
+        let metadata          = [0u8; 32]; // BYTES32_ZERO
+        let builder_field     = [0u8; 32]; // BYTES32_ZERO
 
         let struct_hash: [u8; 32] = {
             // 12 fields × 32 bytes
             let mut enc = Vec::with_capacity(12 * 32);
             enc.extend_from_slice(&order_type_hash);
-            enc.extend_from_slice(&pad_u256(salt as u128));          // salt
-            enc.extend_from_slice(&pad_address(&maker_addr_bytes));  // maker
-            enc.extend_from_slice(&pad_address(&maker_addr_bytes));  // signer = maker (EOA)
-            enc.extend_from_slice(&token_id_u256);                   // tokenId
-            enc.extend_from_slice(&pad_u256(maker_amount));          // makerAmount
-            enc.extend_from_slice(&pad_u256(taker_amount));          // takerAmount
-            enc.extend_from_slice(&pad_u256(side_u8 as u128));       // side (uint8)
-            enc.extend_from_slice(&pad_u256(0));                     // signatureType = 0 (EOA)
-            enc.extend_from_slice(&pad_u256(timestamp_ms as u128));  // timestamp (ms)
-            enc.extend_from_slice(&metadata);                        // metadata (bytes32 zero)
-            enc.extend_from_slice(&builder);                         // builder (bytes32 zero)
+            enc.extend_from_slice(&pad_u256(salt as u128));           // salt
+            enc.extend_from_slice(&pad_address(&maker_addr_bytes));   // maker (funder/proxy)
+            enc.extend_from_slice(&pad_address(&signer_addr_bytes));  // signer (EOA)
+            enc.extend_from_slice(&token_id_u256);                    // tokenId
+            enc.extend_from_slice(&pad_u256(maker_amount));           // makerAmount
+            enc.extend_from_slice(&pad_u256(taker_amount));           // takerAmount
+            enc.extend_from_slice(&pad_u256(side_u8 as u128));        // side (uint8)
+            enc.extend_from_slice(&pad_u256(sig_type as u128));       // signatureType
+            enc.extend_from_slice(&pad_u256(timestamp_ms as u128));   // timestamp (ms)
+            enc.extend_from_slice(&metadata);                         // metadata (bytes32 zero)
+            enc.extend_from_slice(&builder_field);                    // builder (bytes32 zero)
             let mut h = Keccak256::new();
             h.update(&enc);
             h.finalize().into()
@@ -621,35 +625,47 @@ pub async fn execute_live_buy(
     order_value: f64,
     neg_risk:    bool,
 ) -> Result<(f64, u64, Option<String>), String> {
+    use crate::config::CONFIG;
+    // maker = funder/proxy wallet if configured, otherwise EOA
+    let maker_address = if CONFIG.funder_address.is_empty() {
+        signer.wallet_address.clone()
+    } else {
+        CONFIG.funder_address.clone()
+    };
+    let sig_type = CONFIG.signature_type;
+
     let salt = random_salt();
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let sig  = signer.sign_order(token_id, buy_price, buy_size, Side::Buy, salt, neg_risk, timestamp_ms)?;
+    let sig = signer.sign_order(
+        token_id, buy_price, buy_size, Side::Buy,
+        salt, neg_risk, timestamp_ms, &maker_address, sig_type,
+    )?;
 
-    // Compute amounts (mirrors the signing logic for the JSON body).
+    // Compute amounts with proper rounding (not truncation) to avoid float precision issues.
     let usdc_scale   = 1_000_000u128;
-    let maker_amount = ((buy_price * buy_size as f64) * usdc_scale as f64) as u128;
+    let maker_amount = ((buy_price * buy_size as f64) * usdc_scale as f64).round() as u128;
     let taker_amount = buy_size as u128 * usdc_scale;
 
     let body = ClobOrderPayload {
         order: OrderInner {
             salt,
-            maker:          signer.wallet_address.clone(),
+            maker:          maker_address.clone(),
             signer:         signer.wallet_address.clone(),
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             side:           "BUY".to_string(),
             expiration:     "0".to_string(),
-            signature_type: 0,
+            signature_type: sig_type,
             timestamp:      timestamp_ms.to_string(),
             metadata:       "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             builder:        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             signature:      sig,
         },
-        owner:      signer.wallet_address.clone(),
+        owner:      maker_address.clone(),
         order_type: "FAK".to_string(),
         defer_exec: false,
         post_only:  false,
@@ -732,34 +748,45 @@ pub async fn execute_live_sell(
     shares:     u64,
     neg_risk:   bool,
 ) -> Result<(f64, Option<String>), String> {
+    use crate::config::CONFIG;
+    let maker_address = if CONFIG.funder_address.is_empty() {
+        signer.wallet_address.clone()
+    } else {
+        CONFIG.funder_address.clone()
+    };
+    let sig_type = CONFIG.signature_type;
+
     let salt = random_salt();
     let timestamp_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let sig  = signer.sign_order(token_id, sell_price, shares, Side::Sell, salt, neg_risk, timestamp_ms)?;
+    let sig = signer.sign_order(
+        token_id, sell_price, shares, Side::Sell,
+        salt, neg_risk, timestamp_ms, &maker_address, sig_type,
+    )?;
 
     let usdc_scale   = 1_000_000u128;
     let maker_amount = shares as u128 * usdc_scale;
-    let taker_amount = ((sell_price * shares as f64) * usdc_scale as f64) as u128;
+    let taker_amount = ((sell_price * shares as f64) * usdc_scale as f64).round() as u128;
 
     let body = ClobOrderPayload {
         order: OrderInner {
             salt,
-            maker:          signer.wallet_address.clone(),
+            maker:          maker_address.clone(),
             signer:         signer.wallet_address.clone(),
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
             side:           "SELL".to_string(),
             expiration:     "0".to_string(),
-            signature_type: 0,
+            signature_type: sig_type,
             timestamp:      timestamp_ms.to_string(),
             metadata:       "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             builder:        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
             signature:      sig,
         },
-        owner:      signer.wallet_address.clone(),
+        owner:      maker_address.clone(),
         order_type: "FAK".to_string(),
         defer_exec: false,
         post_only:  false,
@@ -1714,7 +1741,7 @@ mod tests {
                 "0x3c8dcc398b9110e07066964267e20087307e53e336afa2379beae37f1d72359a",
                 "Order hash does not match Python reference!"
             );
-            let sig = signer.sign_order(token_id, 0.35, 10, side, salt, neg_risk, ts_ms).unwrap();
+            let sig = signer.sign_order(token_id, 0.35, 10, side, salt, neg_risk, ts_ms, &signer.wallet_address.clone(), 0).unwrap();
             println!("Rust   signature:   {sig}");
             assert_eq!(sig, "0x815661e9ecc72f2d04eb602633e162ddd7f3ea4d0a259b99c387a61a4140ddfc3905ad565498888fce100f173332f04562d59f78b2965eaf6ee939323915bf9f1b",
                 "Signature does not match Python reference!");

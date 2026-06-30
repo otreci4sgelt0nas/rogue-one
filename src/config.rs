@@ -94,6 +94,17 @@ pub struct Config {
     /// Stored as `String` so it can be zeroised on drop by the caller if needed.
     pub private_key: String,
 
+    /// Polymarket deposit/proxy wallet address (the `maker` in orders).
+    /// 0 = EOA (no proxy), 1 = PolyProxy, 2 = Gnosis Safe.
+    /// Set FUNDER_ADDRESS in .env to the proxy/safe wallet address.
+    /// If empty, the bot uses the EOA as maker (signatureType=0).
+    pub funder_address: String,
+
+    /// EIP-712 signatureType for order signing.
+    /// 0 = EOA, 1 = PolyProxy, 2 = Gnosis Safe.
+    /// Must match the funder_address wallet type.
+    pub signature_type: u8,
+
     // ── Trade Execution ───────────────────────────────────────────────────────
     /// Maximum multiplier applied to base position size when compounding wins.
     pub max_position_multiplier: f64,
@@ -340,9 +351,13 @@ impl Config {
         let poly_ws_url =
             env_str("POLY_WS_URL", "wss://ws-subscriptions-clob.polymarket.com/ws/market");
 
-        // ── Credentials ───────────────────────────────────────────────────────
-        let poly_rpc_url = env_str("POLY_RPC_URL", "");
-        let private_key  = env_str("PRIVATE_KEY", "");
+        // ── Credentials ──────────────────────────────────────────────────
+        let poly_rpc_url   = env_str("POLY_RPC_URL", "");
+        let private_key    = env_str("PRIVATE_KEY", "");
+        let funder_address = env_str("FUNDER_ADDRESS", "");
+        let signature_type = env_str("SIGNATURE_TYPE", "0")
+            .parse::<u8>()
+            .unwrap_or(0);
 
         if private_key.is_empty() && !paper_mode {
             // Hard error: live trading with no private key is impossible.
@@ -513,6 +528,8 @@ impl Config {
             poly_ws_url,
             poly_rpc_url,
             private_key,
+            funder_address,
+            signature_type,
             max_position_multiplier,
             take_profit_pct,
             slippage_bps,
