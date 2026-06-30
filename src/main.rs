@@ -186,14 +186,22 @@ async fn main() {
         }
     }
 
-    // ── Step 6: Initialize ClobExecutor ──────────────────────────────────────
-    // Builds the shared reqwest HTTP client, derives L2 credentials from the
-    // private key (if configured), and sets the initial bankroll:
-    //   - Paper mode: from CONFIG.starting_bankroll.
-    //   - Live mode:  0.0 here; reconciled from on-chain USDC balance on the
-    //                 first iteration of the position manager.
+    // ── Step 6: Initialize ClobExecutor ──────────────────────────────────
+    // Builds the shared reqwest HTTP client and derives the wallet address.
+    // In live mode, immediately derives L2 API credentials from the L1 key
+    // via POST /auth/derive-api-key — fails fast if this step fails so no
+    // orders are ever attempted without valid auth.
     info!("Initialising CLOB executor...");
     let executor = ClobExecutor::new(Arc::clone(&state));
+
+    if !CONFIG.paper_mode {
+        info!("🔑 Deriving L2 API credentials (live mode)...");
+        if let Err(e) = executor.init_live_auth().await {
+            error!(error = %e, "❌ L2 credential derivation failed — cannot trade live. Aborting.");
+            std::process::exit(1);
+        }
+        info!("✅ L2 credentials ready. Live order submission enabled.");
+    }
 
     // ── Step 7: Spawn SituationRoom heuristics loop ───────────────────────────
     // Runs every 500 ms on a dedicated tokio task.  Reads the current EMA,
