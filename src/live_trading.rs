@@ -1629,6 +1629,100 @@ mod tests {
         let _ = (s1, s2);
     }
 
+    /// Cross-validate order signing against py_clob_client_v2 reference output.
+    ///
+    /// Python reference generated with fixed inputs:
+    ///   exchange = 0xe222...0F59 (neg_risk), token = 1458...2908
+    ///   salt=42, ts_ms=1750000000000, price=0.35, size=10
+    ///   maker/signer = wallet derived from PRIVATE_KEY
+    ///   Expected order_hash = 0x3c8dcc...359a
+    #[test]
+    fn sign_order_matches_python_reference() {
+        dotenvy::dotenv().ok();
+        let pk = std::env::var("PRIVATE_KEY")
+            .unwrap_or_else(|_| "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80".to_string());
+
+        // Only run meaningful assertion if using the real key.
+        let using_real_key = pk != "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+        let signer = LiveSigner::from_hex_key(&pk).expect("valid key");
+        let token_id = "14584067488723929993675351699740384033719862943912599772935229691412563272908";
+        let salt: u64      = 42;
+        let ts_ms: u64     = 1750000000000;
+        let maker_amount: u128 = 3500000;
+        let taker_amount: u128 = 10000000;
+        let side           = Side::Buy;
+        let neg_risk       = true;  // uses 0xe222...0F59
+
+        // Reproduce the sign_order digest manually.
+        use sha3::{Digest as _, Keccak256};
+
+        let order_type_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"Order(uint256 salt,address maker,address signer,uint256 tokenId,uint256 makerAmount,uint256 takerAmount,uint8 side,uint8 signatureType,uint256 timestamp,bytes32 metadata,bytes32 builder)");
+            h.finalize().into()
+        };
+        let domain_type_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)");
+            h.finalize().into()
+        };
+        let name_hash: [u8; 32] = { let mut h = Keccak256::new(); h.update(b"Polymarket CTF Exchange"); h.finalize().into() };
+        let ver_hash:  [u8; 32] = { let mut h = Keccak256::new(); h.update(b"2"); h.finalize().into() };
+        let exchange_bytes = decode_address(CTF_EXCHANGE_NEG_RISK).unwrap();
+        let domain_sep: [u8; 32] = {
+            let mut enc = Vec::with_capacity(5 * 32);
+            enc.extend_from_slice(&domain_type_hash);
+            enc.extend_from_slice(&name_hash);
+            enc.extend_from_slice(&ver_hash);
+            enc.extend_from_slice(&pad_u256(137));
+            enc.extend_from_slice(&pad_address(&exchange_bytes));
+            let mut h = Keccak256::new(); h.update(&enc); h.finalize().into()
+        };
+        let maker_addr = decode_address(&signer.wallet_address).unwrap();
+        let token_u256 = token_id_to_u256(token_id).unwrap();
+        let struct_hash: [u8; 32] = {
+            let mut enc = Vec::with_capacity(12 * 32);
+            enc.extend_from_slice(&order_type_hash);
+            enc.extend_from_slice(&pad_u256(salt as u128));
+            enc.extend_from_slice(&pad_address(&maker_addr));
+            enc.extend_from_slice(&pad_address(&maker_addr));
+            enc.extend_from_slice(&token_u256);
+            enc.extend_from_slice(&pad_u256(maker_amount));
+            enc.extend_from_slice(&pad_u256(taker_amount));
+            enc.extend_from_slice(&pad_u256(side as u128));
+            enc.extend_from_slice(&pad_u256(0)); // signatureType
+            enc.extend_from_slice(&pad_u256(ts_ms as u128));
+            enc.extend_from_slice(&[0u8; 32]); // metadata
+            enc.extend_from_slice(&[0u8; 32]); // builder
+            let mut h = Keccak256::new(); h.update(&enc); h.finalize().into()
+        };
+        let order_hash: [u8; 32] = {
+            let mut h = Keccak256::new();
+            h.update(b"\x19\x01");
+            h.update(domain_sep);
+            h.update(struct_hash);
+            h.finalize().into()
+        };
+
+        let order_hash_hex = format!("0x{}", hex::encode(order_hash));
+        println!("Rust   order_hash: {order_hash_hex}");
+
+        if using_real_key {
+            assert_eq!(
+                order_hash_hex,
+                "0x3c8dcc398b9110e07066964267e20087307e53e336afa2379beae37f1d72359a",
+                "Order hash does not match Python reference!"
+            );
+            let sig = signer.sign_order(token_id, 0.35, 10, side, salt, neg_risk, ts_ms).unwrap();
+            println!("Rust   signature:   {sig}");
+            assert_eq!(sig, "0x815661e9ecc72f2d04eb602633e162ddd7f3ea4d0a259b99c387a61a4140ddfc3905ad565498888fce100f173332f04562d59f78b2965eaf6ee939323915bf9f1b",
+                "Signature does not match Python reference!");
+        } else {
+            println!("Skipping assertion — using dummy test key, not the real private key.");
+        }
+    }
+
     /// Live RPC integration test — requires real POLY_RPC_URL and wallet in env.
     /// Run with: cargo test rpc_pusd_balance -- --nocapture --ignored
     #[tokio::test]
